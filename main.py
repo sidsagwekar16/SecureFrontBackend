@@ -1,0 +1,721 @@
+##############################################
+# main.py - Single File SecureFront Application
+# Version: 1.3.16  # Updated version for sites CRUD and broadcast
+# Last Updated: 2025-03-16
+##############################################
+
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional
+from firebase_admin import auth
+from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from firebase_admin import credentials, initialize_app, firestore
+from shapely.geometry import Point, Polygon
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+#####################################################
+# 1. Firebase & Firestore Setup
+#####################################################
+
+import os
+import base64
+if "FIREBASE_CREDENTIALS_BASE64" in os.environ:
+    decoded = base64.b64decode(os.environ["FIREBASE_CREDENTIALS_BASE64"])
+    with open("firebase_key.json", "wb") as f:
+        f.write(decoded)
+    cred = credentials.Certificate("firebase_key.json")
+else:
+    cred = credentials.Certificate("serviceAccountKey.json")  # fallback
+
+initialize_app(cred)
+db = firestore.client()
+
+#####################################################
+# 2. Firestore Helper Functions
+#####################################################
+
+def add_document(collection: str, data: dict) -> dict:
+    doc_ref = db.collection(collection).document()
+    id_field = "agencyId" if collection == "agencies" else "id"
+    data[id_field] = doc_ref.id
+    now = datetime.utcnow().isoformat() + "Z"
+    data["createdAt"] = now
+    data["updatedAt"] = now
+    logger.info(f"Adding document to {collection} with {id_field}: {doc_ref.id}")
+    doc_ref.set(data)
+    return data
+
+def get_documents_by_field(collection: str, field: str, value: str) -> List[dict]:
+    logger.info(f"Querying {collection} where {field} = {value}")
+    docs = db.collection(collection).stream() if field == "all" else db.collection(collection).where(field, "==", value).stream()
+    result = [doc.to_dict() for doc in docs]
+    logger.info(f"Found {len(result)} documents in {collection}")
+    return result
+
+def get_document_by_id(collection: str, doc_id: str) -> dict:
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="Document ID is required")
+    logger.info(f"Fetching document from {collection} with ID: {doc_id}")
+    doc_ref = db.collection(collection).document(doc_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        logger.error(f"Document with ID {doc_id} not found in {collection}")
+        raise HTTPException(status_code=404, detail=f"Document with ID {doc_id} not found in {collection}")
+    logger.info(f"Found document: {doc.to_dict()}")
+    return doc.to_dict()
+
+def update_document(collection: str, doc_id: str, data: dict) -> dict:
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="Document ID is required")
+    doc_ref = db.collection(collection).document(doc_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(status_code=404, detail=f"Document with ID {doc_id} not found in {collection}")
+    now = datetime.utcnow().isoformat() + "Z"
+    data["updatedAt"] = now
+    doc_ref.update(data)
+    return doc_ref.get().to_dict()
+
+def delete_document(collection: str, doc_id: str):
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="Document ID is required")
+    doc_ref = db.collection(collection).document(doc_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(status_code=404, detail=f"Document with ID {doc_id} not found in {collection}")
+    doc_ref.delete()
+
+def is_inside_geofence(user_lat: float, user_lng: float, polygon_coords: List[Dict[str, float]]) -> bool:
+    polygon_points = [(p["lng"], p["lat"]) for p in polygon_coords]
+    polygon = Polygon(polygon_points)
+    point = Point(user_lng, user_lat)
+    return polygon.contains(point)
+
+def validate_geofence_coordinates(coordinates: List[Dict[str, float]]) -> None:
+    if len(coordinates) < 3:
+        raise HTTPException(status_code=400, detail="Geofence must have at least 3 coordinates to form a polygon")
+    for coord in coordinates:
+        if "lat" not in coord or "lng" not in coord:
+            raise HTTPException(status_code=400, detail="Each coordinate must have 'lat' and 'lng' fields")
+        if not isinstance(coord["lat"], (int, float)) or not isinstance(coord["lng"], (int, float)):
+            raise HTTPException(status_code=400, detail="Coordinates 'lat' and 'lng' must be numbers")
+    try:
+        polygon_points = [(p["lat"], p["lng"]) for p in coordinates]
+        Polygon(polygon_points)
+    except Exception as e:
+        logger.error(f"Invalid geofence coordinates: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid geofence coordinates: unable to form a valid polygon")
+
+#####################################################
+# 3. Pydantic Models
+#####################################################
+
+class LoginRequest(BaseModel):
+    idToken: str
+
+class AgencyCreate(BaseModel):
+    name: str
+    contactEmail: str
+    contactPhone: str
+    address: str
+    subscriptionPlan: str
+
+class Agency(AgencyCreate):
+    agencyId: str
+    createdAt: str
+    updatedAt: str
+
+class Site(BaseModel):
+    siteId: Optional[str] = None
+    agencyId: str
+    name: str
+    description: str
+    address: str
+    assignedHours: int
+    location: Dict[str, float]
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class Shift(BaseModel):
+    shiftId: Optional[str] = None
+    agencyId: str
+    employeeId: str
+    siteId: str
+    shiftStart: str
+    shiftEnd: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class LeaveRequest(BaseModel):
+    leaveRequestId: Optional[str] = None
+    agencyId: str
+    userId: str
+    startDate: str
+    endDate: str
+    reason: str
+    status: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class Incident(BaseModel):
+    incidentId: Optional[str] = None
+    agencyId: str
+    siteId: str
+    userId: str
+    timestamp: str
+    description: str
+    images: Optional[List[str]] = []
+    location: Dict[str, float]
+    severity: str
+    status: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class GeoFence(BaseModel):
+    geoFenceId: Optional[str] = None
+    agencyId: str
+    siteId: str
+    coordinates: List[Dict[str, float]]
+    radius: Optional[float] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class Billing(BaseModel):
+    billingId: Optional[str] = None
+    agencyId: str
+    stripeCustomerId: str
+    subscriptionId: str
+    currentPlan: str
+    nextBillingDate: str
+    paymentHistory: Optional[List[dict]] = []
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class BreakPeriod(BaseModel):
+    breakStart: str
+    breakEnd: Optional[str] = None
+
+class Attendance(BaseModel):
+    attendanceId: Optional[str] = None
+    agencyId: str
+    userId: str
+    siteId: str
+    clockIn: str
+    clockOut: Optional[str] = None
+    breakPeriods: Optional[List[BreakPeriod]] = []
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class Message(BaseModel):
+    messageId: Optional[str] = None
+    agencyId: str
+    senderId: str
+    text: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class BroadcastMessage(BaseModel):
+    siteId: str
+    text: str
+
+class HourlyReport(BaseModel):
+    reportId: Optional[str] = None
+    agencyId: str
+    siteId: str
+    userId: str  # 👈 Needed to fetch employee-specific reports
+    reportText: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class EmployeeModel(BaseModel):
+    name: str
+    employeeCode: str
+    role: str
+    status: str
+    site: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    dateOfBirth: Optional[str] = None
+    emergencyContact: Optional[str] = None
+    emergencyPhone: Optional[str] = None
+    agencyId: str
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+#####################################################
+# 4. FastAPI Application
+#####################################################
+
+app = FastAPI(
+    title="SecureFront Single-File API",
+    description="API without authentication for testing purposes",
+    version="1.3.16"  # Updated version
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+#####################################################
+#  login endpoints
+#####################################################
+@app.post("/auth/login")
+def login_user(payload: LoginRequest):
+    try:
+        decoded_token = auth.verify_id_token(payload.idToken)
+        uid = decoded_token['uid']
+
+        # Try to fetch agencyId from custom claims or fallback to Firestore user doc
+        agency_id = decoded_token.get("agencyId")
+        if not agency_id:
+            user_doc = db.collection("users").document(uid).get()
+            if user_doc.exists:
+                agency_id = user_doc.to_dict().get("agencyId")
+
+        if not agency_id:
+            raise HTTPException(status_code=400, detail="Agency ID not associated with user")
+
+        return {
+            "message": "Login successful",
+            "uid": uid,
+            "agencyId": agency_id
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
+    
+
+@app.post("/auth/logout")
+def logout_user():
+    return {
+        "message": "Logout handled client-side by clearing session/token."
+    }
+
+    
+    
+#####################################################
+# 5. Agency Endpoints
+#####################################################
+
+@app.get("/v1/agencies", response_model=List[Agency])
+def read_agencies():
+    docs = db.collection("agencies").stream()
+    result = []
+    for doc in docs:
+        agency_data = doc.to_dict()
+        if "id" in agency_data and "agencyId" not in agency_data:
+            agency_data["agencyId"] = agency_data.pop("id")
+        result.append(agency_data)
+    logger.info(f"Retrieved {len(result)} agencies")
+    return result
+
+@app.get("/v1/agencies/{agency_id}", response_model=Agency)
+def read_agency(agency_id: str):
+    agency_data = get_document_by_id("agencies", agency_id)
+    if "id" in agency_data and "agencyId" not in agency_data:
+        agency_data["agencyId"] = agency_data.pop("id")
+    return agency_data
+
+@app.post("/v1/agencies", response_model=Agency)
+def create_agency(agency: AgencyCreate):
+    data = agency.dict()
+    return add_document("agencies", data)
+
+#####################################################
+# 6. Site Endpoints (Enhanced CRUD)
+#####################################################
+
+@app.get("/v1/sites", response_model=List[Site])
+def read_sites(agency_id: str = Query(...)):
+    sites = get_documents_by_field("sites", "agencyId", agency_id)
+    logger.info(f"Retrieved {len(sites)} sites for agency {agency_id}")
+    return sites
+
+@app.get("/v1/sites/{site_id}", response_model=Site)
+def read_site(site_id: str, agency_id: str = Query(...)):
+    site = get_document_by_id("sites", site_id)
+    if site.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized access attempt to site {site_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    logger.info(f"Retrieved site {site_id} for agency {agency_id}")
+    return site
+
+@app.post("/v1/sites", response_model=Site)
+def create_site(site: Site):
+    data = site.dict(exclude_unset=True)
+    result = add_document("sites", data)
+    logger.info(f"Created site {result['id']} for agency {data['agencyId']}")
+    return result
+
+@app.put("/v1/sites/{site_id}", response_model=Site)
+def update_site(site_id: str, site: Site, agency_id: str = Query(...)):
+    existing_site = get_document_by_id("sites", site_id)
+    if existing_site.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized update attempt to site {site_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    data = site.dict(exclude_unset=True)
+    data["siteId"] = site_id
+    result = update_document("sites", site_id, data)
+    logger.info(f"Updated site {site_id} for agency {agency_id}")
+    return result
+
+@app.patch("/v1/sites/{site_id}", response_model=Site)
+def partial_update_site(site_id: str, site: Site, agency_id: str = Query(...)):
+    existing_site = get_document_by_id("sites", site_id)
+    if existing_site.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized patch attempt to site {site_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    data = site.dict(exclude_unset=True, exclude_none=True)
+    result = update_document("sites", site_id, data)
+    logger.info(f"Partially updated site {site_id} for agency {agency_id}")
+    return result
+
+@app.delete("/v1/sites/{site_id}")
+def delete_site(site_id: str, agency_id: str = Query(...)):
+    site = get_document_by_id("sites", site_id)
+    if site.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized delete attempt to site {site_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    delete_document("sites", site_id)
+    logger.info(f"Deleted site {site_id} for agency {agency_id}")
+    return {"message": f"Site {site_id} deleted"}
+
+#####################################################
+# 7. Shift Endpoints
+#####################################################
+
+@app.get("/v1/shifts", response_model=List[Shift])
+def read_shifts(agency_id: str = Query(...)):
+    return get_documents_by_field("shifts", "agencyId", agency_id)
+
+@app.post("/v1/shifts", response_model=Shift)
+def create_shift(shift: Shift):
+    return add_document("shifts", shift.dict(exclude_unset=True))
+
+@app.delete("/v1/shifts/{shift_id}")
+def delete_shift(shift_id: str, agency_id: str = Query(...)):
+    shift = get_document_by_id("shifts", shift_id)
+    if shift.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    delete_document("shifts", shift_id)
+    return {"message": f"Shift {shift_id} deleted"}
+
+#####################################################
+# 8. Leave Request Endpoints
+#####################################################
+
+@app.get("/v1/leave-requests", response_model=List[LeaveRequest])
+def read_leave_requests(agency_id: str = Query(...)):
+    return get_documents_by_field("leaveRequests", "agencyId", agency_id)
+
+@app.post("/v1/leave-requests", response_model=LeaveRequest)
+def create_leave_request(leave_req: LeaveRequest):
+    return add_document("leaveRequests", leave_req.dict(exclude_unset=True))
+
+#####################################################
+# 9. Incident Endpoints
+#####################################################
+
+@app.get("/v1/incidents", response_model=List[Incident])
+def read_incidents(agency_id: str = Query(...)):
+    return get_documents_by_field("incidents", "agencyId", agency_id)
+
+@app.post("/v1/incidents", response_model=Incident)
+def create_incident(incident: Incident):
+    return add_document("incidents", incident.dict(exclude_unset=True))
+
+#####################################################
+# 10. GeoFence Endpoints
+#####################################################
+
+@app.get("/v1/geofences", response_model=List[GeoFence])
+def read_geofences(agency_id: str = Query(...)):
+    geofences = get_documents_by_field("geofences", "agencyId", agency_id)
+    logger.info(f"Retrieved {len(geofences)} geofences for agency {agency_id}")
+    return geofences
+
+@app.get("/v1/geofences/{geofence_id}", response_model=GeoFence)
+def read_geofence(geofence_id: str, agency_id: str = Query(...)):
+    geofence = get_document_by_id("geofences", geofence_id)
+    if geofence.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized access attempt to geofence {geofence_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    logger.info(f"Retrieved geofence {geofence_id} for agency {agency_id}")
+    return geofence
+
+@app.post("/v1/geofences", response_model=GeoFence)
+def create_geofence(geofence: GeoFence):
+    data = geofence.dict(exclude_unset=True)
+    validate_geofence_coordinates(data["coordinates"])
+    result = add_document("geofences", data)
+    logger.info(f"Created geofence {result['id']} for agency {data['agencyId']} and site {data['siteId']}")
+    return result
+
+@app.put("/v1/geofences/{geofence_id}", response_model=GeoFence)
+def update_geofence(geofence_id: str, geofence: GeoFence, agency_id: str = Query(...)):
+    existing_geofence = get_document_by_id("geofences", geofence_id)
+    if existing_geofence.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized update attempt to geofence {geofence_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    data = geofence.dict(exclude_unset=True)
+    validate_geofence_coordinates(data["coordinates"])
+    data["geoFenceId"] = geofence_id
+    result = update_document("geofences", geofence_id, data)
+    logger.info(f"Updated geofence {geofence_id} for agency {agency_id}")
+    return result
+
+@app.patch("/v1/geofences/{geofence_id}", response_model=GeoFence)
+def partial_update_geofence(geofence_id: str, geofence: GeoFence, agency_id: str = Query(...)):
+    existing_geofence = get_document_by_id("geofences", geofence_id)
+    if existing_geofence.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized patch attempt to geofence {geofence_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    data = geofence.dict(exclude_unset=True, exclude_none=True)
+    if "coordinates" in data:
+        validate_geofence_coordinates(data["coordinates"])
+    result = update_document("geofences", geofence_id, data)
+    logger.info(f"Partially updated geofence {geofence_id} for agency {agency_id}")
+    return result
+
+@app.delete("/v1/geofences/{geofence_id}")
+def delete_geofence(geofence_id: str, agency_id: str = Query(...)):
+    geofence = get_document_by_id("geofences", geofence_id)
+    if geofence.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized delete attempt to geofence {geofence_id} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    delete_document("geofences", geofence_id)
+    logger.info(f"Deleted geofence {geofence_id} for agency {agency_id}")
+    return {"message": f"GeoFence {geofence_id} deleted"}
+
+#####################################################
+# 11. Billing Endpoints
+#####################################################
+
+@app.get("/v1/billing", response_model=List[Billing])
+def read_billing(agency_id: str = Query(...)):
+    return get_documents_by_field("billing", "agencyId", agency_id)
+
+@app.post("/v1/billing", response_model=Billing)
+def create_billing(billing: Billing):
+    return add_document("billing", billing.dict(exclude_unset=True))
+
+#####################################################
+# 12. Attendance Endpoints
+#####################################################
+
+@app.get("/v1/attendance", response_model=List[Attendance])
+def read_attendance(agency_id: str = Query(...)):
+    return get_documents_by_field("attendance", "agencyId", agency_id)
+
+@app.post("/v1/attendance/clockin", response_model=Attendance)
+def clock_in(attendance: Attendance):
+    data = attendance.dict(exclude_unset=True)
+    if "lat" not in data or "lng" not in data:
+        raise HTTPException(status_code=400, detail="Latitude and longitude are required for clock-in")
+    geofences = get_documents_by_field("geofences", "siteId", data["siteId"])
+    if not geofences:
+        raise HTTPException(status_code=404, detail=f"No geofences found for site {data['siteId']}")
+    user_inside_geofence = False
+    for geofence in geofences:
+        if is_inside_geofence(data["lat"], data["lng"], geofence["coordinates"]):
+            user_inside_geofence = True
+            logger.info(f"User {data['userId']} is inside geofence {geofence['geoFenceId']} for site {data['siteId']}")
+            break
+    if not user_inside_geofence:
+        logger.warning(f"User {data['userId']} is outside all geofences for site {data['siteId']}")
+        raise HTTPException(status_code=403, detail="User is outside the geofence for this site")
+    logger.info(f"Clock-in successful for user {data['userId']} at site {data['siteId']}")
+    return add_document("attendance", data)
+
+@app.post("/v1/attendance/clockout", response_model=Attendance)
+def clock_out(attendance_id: str = Query(..., alias="attendanceId"), agency_id: str = Query(...)):
+    attendance = get_document_by_id("attendance", attendance_id)
+    if attendance.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return update_document("attendance", attendance_id, {"clockOut": datetime.utcnow().isoformat() + "Z"})
+
+@app.post("/v1/attendance/break", response_model=Attendance)
+def add_break(attendance_id: str, break_start: str, break_end: Optional[str] = None, agency_id: str = Query(...)):
+    doc = get_document_by_id("attendance", attendance_id)
+    if doc.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    break_periods = doc.get("breakPeriods", [])
+    break_periods.append({"breakStart": break_start, "breakEnd": break_end})
+    return update_document("attendance", attendance_id, {"breakPeriods": break_periods})
+
+#####################################################
+# 13. Message Endpoints (Including Broadcast)
+#####################################################
+
+@app.get("/v1/messages", response_model=List[Message])
+def get_messages(agency_id: str = Query(...)):
+    return get_documents_by_field("messages", "agencyId", agency_id)
+
+@app.post("/v1/messages", response_model=Message)
+def create_message(message: Message):
+    return add_document("messages", message.dict(exclude_unset=True))
+
+@app.post("/v1/messages/broadcast")
+def broadcast_message(broadcast: BroadcastMessage, agency_id: str = Query(...), sender_id: str = Query(..., alias="senderId")):
+    # Verify the site exists and belongs to the agency
+    site = get_document_by_id("sites", broadcast.siteId)
+    if site.get("agencyId") != agency_id:
+        logger.warning(f"Unauthorized broadcast attempt to site {broadcast.siteId} by agency {agency_id}")
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # Find all active attendance records for the site (clocked in, not clocked out)
+    active_attendances = get_documents_by_field("attendance", "siteId", broadcast.siteId)
+    recipients = [
+        attendance["userId"]
+        for attendance in active_attendances
+        if "clockOut" not in attendance or attendance["clockOut"] is None
+    ]
+
+    if not recipients:
+        logger.info(f"No active users found at site {broadcast.siteId} for broadcast")
+        return {"message": f"No active users found at site {broadcast.siteId}"}
+
+    # Send message to each recipient
+    sent_messages = []
+    for user_id in recipients:
+        message_data = {
+            "agencyId": agency_id,
+            "senderId": sender_id,
+            "text": broadcast.text
+        }
+        sent_message = add_document("messages", message_data)
+        sent_messages.append(sent_message["id"])
+    
+    logger.info(f"Broadcast message sent to {len(recipients)} users at site {broadcast.siteId}")
+    return {"message": f"Broadcast sent to {len(recipients)} users", "messageIds": sent_messages}
+
+#####################################################
+# 14. Hourly Report Endpoints
+#####################################################
+
+@app.get("/web/hourly-reports", response_model=List[HourlyReport])
+def get_hourly_reports(agency_id: str = Query(...)):
+    return get_documents_by_field("hourlyReports", "agencyId", agency_id)
+
+@app.post("/web/hourly-reports", response_model=HourlyReport)
+def create_hourly_report(report: HourlyReport):
+    return add_document("hourlyReports", report.dict(exclude_unset=True))
+
+@app.delete("/web/hourly-reports/{report_id}")
+def delete_hourly_report(report_id: str, agency_id: str = Query(...)):
+    report = get_document_by_id("hourlyReports", report_id)
+    if report.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    delete_document("hourlyReports", report_id)
+    return {"message": f"Hourly Report {report_id} deleted"}
+
+#####################################################
+# 15. Scheduling Endpoint
+#####################################################
+
+@app.post("/web/scheduling/optimize")
+def optimize_scheduling(site_id: str, agency_id: str = Query(...)):
+    return {"message": "Scheduling optimization is not fully implemented in single-file mode."}
+
+#####################################################
+# 16. Site Endpoints (Enhanced CRUD)
+#####################################################
+
+@app.post("/web/employee/add")
+def add_employee(employee: EmployeeModel):
+    data = employee.dict(exclude_unset=True)
+    return add_document("employees", data)
+
+@app.get("/web/employee/detail/{employee_id}")
+def get_employee(employee_id: str):
+    return get_document_by_id("employees", employee_id)
+
+@app.get("/web/employee/all")
+def get_all_employees(agency_id: str = Query(...)):
+    return get_documents_by_field("employees", "agencyId", agency_id)
+
+
+#####################################################
+# 16. Site Endpoints (Enhanced CRUD)
+#####################################################
+
+@app.post("/mobile/hourly-reports", response_model=HourlyReport)
+def submit_hourly_report(report: HourlyReport):
+    return add_document("hourlyReports", report.dict(exclude_unset=True))
+
+@app.get("/mobile/hourly-reports", response_model=List[HourlyReport])
+def get_my_reports(user_id: str = Query(...), agency_id: str = Query(...)):
+    reports = db.collection("hourlyReports").where("agencyId", "==", agency_id).where("userId", "==", user_id).stream()
+    return [r.to_dict() for r in reports]
+
+@app.post("/mobile/geofence/verify")
+def verify_geofence(site_id: str = Query(...), lat: float = Query(...), lng: float = Query(...)):
+    geofences = get_documents_by_field("geofences", "siteId", site_id)
+    if not geofences:
+        raise HTTPException(status_code=404, detail="No geofence found for this site")
+    inside = any(is_inside_geofence(lat, lng, g["coordinates"]) for g in geofences)
+    return {"insideGeofence": inside}
+
+@app.get("/mobile/shifts/assigned", response_model=List[Shift])
+def get_assigned_shifts(employee_id: str = Query(...)):
+    return get_documents_by_field("shifts", "employeeId", employee_id)
+
+@app.patch("/mobile/shifts/{shift_id}/status")
+def update_shift_status(shift_id: str, status: str = Query(...), employee_id: str = Query(...)):
+    shift = get_document_by_id("shifts", shift_id)
+    if shift.get("employeeId") != employee_id:
+        raise HTTPException(status_code=403, detail="You are not assigned to this shift")
+    return update_document("shifts", shift_id, {"status": status})
+
+
+@app.get("/mobile/shifts/open", response_model=List[Shift])
+def get_open_shifts(agency_id: str = Query(...)):
+    shifts = db.collection("shifts").where("agencyId", "==", agency_id).where("status", "==", "open").stream()
+    return [s.to_dict() for s in shifts]
+
+@app.patch("/mobile/shifts/{shift_id}/apply")
+def apply_for_shift(shift_id: str, employee_id: str = Query(...)):
+    shift = get_document_by_id("shifts", shift_id)
+    if shift.get("status") != "open" or shift.get("employeeId"):
+        raise HTTPException(status_code=400, detail="Shift is not open for application")
+    return update_document("shifts", shift_id, {
+        "employeeId": employee_id,
+        "status": "pending"
+    })
+
+
+
+
+#####################################################
+
+@app.get("/")
+def root():
+    return {
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.23  — bugs fixed"
+    }
+
+
+#####################################################
+# Usage:
+# 1) Place serviceAccountKey.json next to this file
+# 2) pip install fastapi uvicorn firebase-admin shapely
+# 3) python -m uvicorn main:app --reload
+# 4) Test endpoints with curl/Postman:
+#    - POST /v1/sites {"agencyId": "AGENCY001", "name": "Site1", "description": "Test site", "address": "123 St", "assignedHours": 8, "location": {"lat": 19.171, "lng": 72.845}}
+#    - GET /v1/sites/<site_id>?agency_id=<agency_id>
+#    - PUT /v1/sites/<site_id>?agency_id=<agency_id> {"agencyId": "AGENCY001", "name": "Updated Site", ...}
+#    - PATCH /v1/sites/<site_id>?agency_id=<agency_id> {"name": "Patched Site"}
+#    - DELETE /v1/sites/<site_id>?agency_id=<agency_id>
+#    - POST /v1/messages/broadcast?agency_id=AGENCY001&senderId=OPERATOR001 {"siteId": "SITE001", "text": "Emergency: Evacuate immediately"}
+#####################################################

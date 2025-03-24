@@ -1,0 +1,4 @@
+serviceAccountKey.json
+firebase_key.json
+__pycache__/
+.env
