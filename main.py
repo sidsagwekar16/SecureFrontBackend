@@ -816,7 +816,7 @@ def register_employee(
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.24  — sigup fixed"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.25  — sigup fixed"
     }
 
 
