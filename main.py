@@ -816,7 +816,7 @@ def register_employee(
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.25  — sigup fixed"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.27  — sigup fixed"
     }
 
 
@@ -832,4 +832,4 @@ def root():
 #    - PATCH /v1/sites/<site_id>?agency_id=<agency_id> {"name": "Patched Site"}
 #    - DELETE /v1/sites/<site_id>?agency_id=<agency_id>
 #    - POST /v1/messages/broadcast?agency_id=AGENCY001&senderId=OPERATOR001 {"siteId": "SITE001", "text": "Emergency: Evacuate immediately"}
-#####################################################
+#######################################################
