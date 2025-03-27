@@ -6,6 +6,7 @@
 
 import logging
 from datetime import datetime
+from fastapi import Header, Depends
 from typing import List, Dict, Optional
 from firebase_admin import auth
 from fastapi import FastAPI, HTTPException, Query, Body
@@ -112,6 +113,10 @@ def validate_geofence_coordinates(coordinates: List[Dict[str, float]]) -> None:
 #####################################################
 # 3. Pydantic Models
 #####################################################
+
+class UserAgencyMapping(BaseModel):
+    userId: str
+    agencyId: str
 
 class LoginRequest(BaseModel):
     idToken: str
@@ -238,7 +243,7 @@ class EmployeeModel(BaseModel):
     employeeCode: str
     role: str
     status: str
-    site: str
+    site: Optional[str] = None 
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
@@ -303,7 +308,51 @@ def logout_user():
     }
 
     
+@app.post("/auth/complete-signup")
+def complete_signup(payload: LoginRequest, agency: AgencyCreate):
+    try:
+        decoded_token = auth.verify_id_token(payload.idToken)
+        uid = decoded_token['uid']
+
+        # Check if this user already has an agency
+        user_doc = db.collection("users").document(uid).get()
+        if user_doc.exists:
+            raise HTTPException(status_code=400, detail="User already linked to an agency")
+
+        # ✅ Create agency
+        agency_data = agency.dict()
+        agency_data["ownerId"] = uid
+        new_agency = add_document("agencies", agency_data)
+
+        # ✅ Link user to agency in Firestore (you can later move this to custom claims if needed)
+        db.collection("users").document(uid).set({
+            "agencyId": new_agency["agencyId"]
+        })
+
+        return {"message": "Signup complete", "agencyId": new_agency["agencyId"]}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Signup failed: {str(e)}")
     
+###################################################
+# 🧠 OPTIONAL: Helper to auto-fetch agencyId from user
+#####################################################
+def get_agency_id(authorization: str = Header(...)) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    id_token = authorization.split(" ")[1]
+    try:
+        decoded_token = auth.verify_id_token(id_token)
+        uid = decoded_token["uid"]
+        agency_id = decoded_token.get("agencyId")
+        if not agency_id:
+            user_doc = db.collection("users").document(uid).get()
+            if not user_doc.exists:
+                raise HTTPException(status_code=403, detail="User not linked to an agency")
+            agency_id = user_doc.to_dict().get("agencyId")
+        return agency_id
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=f"Invalid token: {str(e)}")
 #####################################################
 # 5. Agency Endpoints
 #####################################################
@@ -633,9 +682,11 @@ def optimize_scheduling(site_id: str, agency_id: str = Query(...)):
 #####################################################
 
 @app.post("/web/employee/add")
-def add_employee(employee: EmployeeModel):
+def add_employee(employee: EmployeeModel, uid: str = Query(...)):
     data = employee.dict(exclude_unset=True)
+    data["uid"] = uid  # 👈 include Firebase UID for later identification
     return add_document("employees", data)
+
 
 @app.get("/web/employee/detail/{employee_id}")
 def get_employee(employee_id: str):
@@ -695,6 +746,69 @@ def apply_for_shift(shift_id: str, employee_id: str = Query(...)):
     })
 
 
+@app.post("/mobile/employee/login")
+def mobile_login(payload: LoginRequest):
+    try:
+        decoded = auth.verify_id_token(payload.idToken)
+        uid = decoded["uid"]
+
+        # Lookup employee by UID
+        employees = get_documents_by_field("employees", "uid", uid)
+        if not employees:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+        employee = employees[0]
+        return {
+            "message": "Employee login successful",
+            "uid": uid,
+            "employeeId": employee["employeeCode"],
+            "agencyId": employee["agencyId"],
+             "siteId": employee.get("site"), 
+            "name": employee["name"],
+            "status": employee["status"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Mobile login failed: {str(e)}")
+
+
+@app.post("/mobile/employee/register")
+def register_employee(
+    idToken: str = Body(...),
+    employee: EmployeeModel = Body(...)
+):
+    try:
+        decoded = auth.verify_id_token(idToken)
+        uid = decoded["uid"]
+
+        # Check if agency exists
+        agency_doc = db.collection("agencies").document(employee.agencyId).get()
+        if not agency_doc.exists:
+            raise HTTPException(status_code=404, detail="Invalid agency code")
+
+        # Check if this UID is already registered
+        existing = get_documents_by_field("employees", "uid", uid)
+        if existing:
+            raise HTTPException(status_code=400, detail="Employee already registered")
+
+        # Create employee doc with UID
+        data = employee.dict(exclude_unset=True)
+        data["uid"] = uid
+        new_employee = add_document("employees", data)
+
+        return {"message": "Employee registered successfully", 
+        "uid": uid,
+       "employeeId": new_employee["employeeCode"],
+       "agencyId": new_employee["agencyId"],
+       "siteId": new_employee.get("site"),
+       "name": new_employee["name"],
+      "status": new_employee["status"]
+            }   
+
+   
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+
 
 
 #####################################################
@@ -702,7 +816,7 @@ def apply_for_shift(shift_id: str, employee_id: str = Query(...)):
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.23  — bugs fixed"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.24  — sigup fixed"
     }
 
 

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Employee Portal</title>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+</head>
+<body>
+  <h2>🔥 Employee Firebase Auth + SecureFront API</h2>
+
+  <!-- 🔐 Firebase Config -->
+  <script>
+    const firebaseConfig = {
+  apiKey: "AIzaSyBQnLmhyklHc4x_ox7rFbiEpMUk7cgwk_4",
+  authDomain: "front-a7a45.firebaseapp.com",
+  projectId: "front-a7a45",
+  storageBucket: "front-a7a45.firebasestorage.app",
+  messagingSenderId: "15311457690",
+  appId: "1:15311457690:web:560fd0531ae95b9a38fe23",
+  measurementId: "G-LVKKYWBYS9"
+};
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+  </script>
+
+  <!-- 🔻 Signup Form -->
+  <h3>1️⃣ Register (Sign Up)</h3>
+  <input type="email" id="signupEmail" placeholder="Email"><br>
+  <input type="password" id="signupPassword" placeholder="Password"><br>
+  <input type="text" id="signupName" placeholder="Full Name"><br>
+  <input type="text" id="signupCode" placeholder="Employee Code"><br>
+  <input type="text" id="signupRole" placeholder="Role"><br>
+  <input type="text" id="signupAgency" placeholder="Agency ID"><br>
+  <input type="text" id="signupStatus" placeholder="Status" value="active"><br>
+  <button onclick="signup()">Sign Up & Register</button>
+
+  <hr>
+
+  <!-- 🔑 Login Form -->
+  <h3>2️⃣ Login</h3>
+  <input type="email" id="loginEmail" placeholder="Email"><br>
+  <input type="password" id="loginPassword" placeholder="Password"><br>
+  <button onclick="login()">Login & Fetch Profile</button>
+
+  <hr>
+  <pre id="output"></pre>
+
+  <script>
+    async function signup() {
+      const email = document.getElementById("signupEmail").value;
+      const password = document.getElementById("signupPassword").value;
+      const name = document.getElementById("signupName").value;
+      const code = document.getElementById("signupCode").value;
+      const role = document.getElementById("signupRole").value;
+      const agency = document.getElementById("signupAgency").value;
+      const status = document.getElementById("signupStatus").value;
+
+      try {
+        const userCredential = await auth.createUserWithEmailAndPassword(email, password);
+        const idToken = await userCredential.user.getIdToken();
+
+        const payload = {
+          idToken,
+          employee: {
+            name,
+            employeeCode: code,
+            role,
+            status,
+            agencyId: agency
+          }
+        };
+
+        const res = await fetch("http://127.0.0.1:8000/mobile/employee/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const result = await res.json();
+        document.getElementById("output").textContent = JSON.stringify(result, null, 2);
+      } catch (err) {
+        document.getElementById("output").textContent = "Signup Error:\n" + err.message;
+      }
+    }
+
+    async function login() {
+      const email = document.getElementById("loginEmail").value;
+      const password = document.getElementById("loginPassword").value;
+
+      try {
+        const userCredential = await auth.signInWithEmailAndPassword(email, password);
+        const idToken = await userCredential.user.getIdToken();
+
+        const res = await fetch("http://127.0.0.1:8000/auth/mobile-login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idToken })
+        });
+
+        const result = await res.json();
+        document.getElementById("output").textContent = JSON.stringify(result, null, 2);
+      } catch (err) {
+        document.getElementById("output").textContent = "Login Error:\n" + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
