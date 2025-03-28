@@ -241,8 +241,8 @@ class HourlyReport(BaseModel):
 class EmployeeModel(BaseModel):
     name: str
     employeeCode: str
-    role: str
-    status: str
+    role: Optional[str] = None 
+    status: Optional[str] = None 
     site: Optional[str] = None 
     email: Optional[str] = None
     phone: Optional[str] = None
@@ -771,40 +771,53 @@ def mobile_login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail=f"Mobile login failed: {str(e)}")
 
 
+from fastapi import Body, HTTPException
+from pydantic import BaseModel
+
+class EmployeeRegisterPayload(BaseModel):
+    idToken: str
+    agencyCode: str
+    employee: EmployeeModel
+
 @app.post("/mobile/employee/register")
-def register_employee(
-    idToken: str = Body(...),
-    employee: EmployeeModel = Body(...)
-):
+def register_employee(input: EmployeeRegisterPayload):
     try:
-        decoded = auth.verify_id_token(idToken)
+        decoded = auth.verify_id_token(input.idToken)
         uid = decoded["uid"]
 
-        # Check if agency exists
-        agency_doc = db.collection("agencies").document(employee.agencyId).get()
-        if not agency_doc.exists:
-            raise HTTPException(status_code=404, detail="Invalid agency code")
-
-        # Check if this UID is already registered
+        # ✅ Check if employee already exists
         existing = get_documents_by_field("employees", "uid", uid)
         if existing:
             raise HTTPException(status_code=400, detail="Employee already registered")
 
-        # Create employee doc with UID
-        data = employee.dict(exclude_unset=True)
+        # ✅ Find agency via code
+        agency_query = db.collection("agencies").where("code", "==", input.agencyCode).limit(1).stream()
+        agency_doc = next(agency_query, None)
+        if not agency_doc:
+            raise HTTPException(status_code=404, detail="Invalid agency code")
+
+        agency_data = agency_doc.to_dict()
+        agency_id = agency_data["agencyId"]
+
+        # ✅ Prepare employee data
+        data = input.employee.dict(exclude_unset=True)
         data["uid"] = uid
+        data["agencyId"] = agency_id
+        data["status"] = "active"  # default
+        data["createdAt"] = datetime.utcnow().isoformat() + "Z"
+        data["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+
         new_employee = add_document("employees", data)
 
-        return {"message": "Employee registered successfully", 
-        "uid": uid,
-       "employeeId": new_employee["employeeCode"],
-       "agencyId": new_employee["agencyId"],
-       "siteId": new_employee.get("site"),
-       "name": new_employee["name"],
-      "status": new_employee["status"]
-            }   
-
-   
+        return {
+            "message": "Employee registered successfully",
+            "uid": uid,
+            "employeeId": new_employee.get("employeeCode", new_employee["id"]),
+            "agencyId": agency_id,
+            "siteId": new_employee.get("site"),
+            "name": new_employee["name"],
+            "status": new_employee["status"]
+        }
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
@@ -816,7 +829,7 @@ def register_employee(
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.27  — sigup fixed"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.28 mobile signup fixed"
     }
 
 
