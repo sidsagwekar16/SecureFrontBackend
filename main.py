@@ -687,6 +687,20 @@ def add_employee(employee: EmployeeModel, uid: str = Query(...)):
     data["uid"] = uid  # 👈 include Firebase UID for later identification
     return add_document("employees", data)
 
+@app.patch("/web/employee/{id}")
+def update_employee(id: str, employee: EmployeeModel, agency_id: str = Query(...)):
+    existing = get_document_by_id("employees", id)
+    if existing["agencyId"] != agency_id:
+        raise HTTPException(403, "Unauthorized")
+    return update_document("employees", id, employee.dict(exclude_unset=True))
+
+@app.delete("/web/employee/{id}")
+def delete_employee(id: str, agency_id: str = Query(...)):
+    existing = get_document_by_id("employees", id)
+    if existing["agencyId"] != agency_id:
+        raise HTTPException(403, "Unauthorized")
+    delete_document("employees", id)
+    return {"message": "Deleted"}
 
 @app.get("/web/employee/detail/{employee_id}")
 def get_employee(employee_id: str):
@@ -829,7 +843,7 @@ def register_employee(input: EmployeeRegisterPayload):
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.28 mobile signup fixed"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.28 employyee delete edit "
     }
 
 
