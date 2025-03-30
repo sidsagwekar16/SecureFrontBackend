@@ -59,8 +59,22 @@ def add_document(collection: str, data: dict) -> dict:
 
 def get_documents_by_field(collection: str, field: str, value: str) -> List[dict]:
     logger.info(f"Querying {collection} where {field} = {value}")
-    docs = db.collection(collection).stream() if field == "all" else db.collection(collection).where(field, "==", value).stream()
-    result = [doc.to_dict() for doc in docs]
+    docs = (
+        db.collection(collection).stream()
+        if field == "all"
+        else db.collection(collection).where(field, "==", value).stream()
+    )
+
+    result = []
+    for doc in docs:
+        data = doc.to_dict()
+
+        # 🔁 Inject Firestore document ID safely
+        if "id" not in data:
+            data["id"] = doc.id
+
+        result.append(data)
+
     logger.info(f"Found {len(result)} documents in {collection}")
     return result
 
@@ -140,6 +154,7 @@ class Agency(AgencyCreate):
     updatedAt: str
 
 class Site(BaseModel):
+    id: Optional[str] = None  # ✅ Add this line
     siteId: Optional[str] = None
     agencyId: str
     name: str
@@ -417,8 +432,15 @@ def create_agency(agency: AgencyCreate):
 @app.get("/v1/sites", response_model=List[Site])
 def read_sites(agency_id: str = Query(...)):
     sites = get_documents_by_field("sites", "agencyId", agency_id)
+
+    # 🔁 Convert Firestore document ID to siteId so the Pydantic model picks it up
+    for site in sites:
+        if "siteId" not in site:
+            site["siteId"] = site["id"]  # ✅ Fix is here
+
     logger.info(f"Retrieved {len(sites)} sites for agency {agency_id}")
     return sites
+
 
 @app.get("/v1/sites/{site_id}", response_model=Site)
 def read_site(site_id: str, agency_id: str = Query(...)):
