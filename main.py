@@ -5,6 +5,7 @@
 ##############################################
 
 import logging
+from typing import Annotated
 from datetime import datetime
 from fastapi import Header, Depends
 from typing import List, Dict, Optional
@@ -14,6 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from firebase_admin import credentials, initialize_app, firestore
 from shapely.geometry import Point, Polygon
+from pydantic import BaseModel, constr
+from typing import Optional
+import uuid
+import random
+import string
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -237,6 +243,23 @@ class HourlyReport(BaseModel):
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
+class SiteNotification(BaseModel):
+    siteId: str
+    senderId: str
+    agencyId: str
+    text: str
+    audience: Optional[str] = "clocked-in"
+    createdAt: Optional[str] = None
+
+
+class JoinCode(BaseModel):
+    code: str
+    agencyId: str
+    used: bool = False
+    createdAt: Optional[str] = None
+    usedAt: Optional[str] = None
+    usedBy: Optional[str] = None    
+
 
 class EmployeeModel(BaseModel):
     name: str
@@ -253,6 +276,12 @@ class EmployeeModel(BaseModel):
     agencyId: str
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
+
+
+class EmployeeJoinCodeRegisterPayload(BaseModel):
+    idToken: str
+    joinCode: str
+    employee: EmployeeModel
 
 #####################################################
 # 4. FastAPI Application
@@ -615,39 +644,59 @@ def get_messages(agency_id: str = Query(...)):
 def create_message(message: Message):
     return add_document("messages", message.dict(exclude_unset=True))
 
-@app.post("/v1/messages/broadcast")
-def broadcast_message(broadcast: BroadcastMessage, agency_id: str = Query(...), sender_id: str = Query(..., alias="senderId")):
-    # Verify the site exists and belongs to the agency
+def get_sender_id(authorization: str = Header(...)) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Invalid token")
+    token = authorization.split(" ")[1]
+    decoded = auth.verify_id_token(token)
+    return decoded["uid"]
+
+@app.post("/v1/messages/broadcast", response_model=Dict[str, str])
+def broadcast_message(
+    broadcast: BroadcastMessage,
+    agency_id: str = Query(...),
+    sender_id: str = Query(..., alias="senderId")
+):
     site = get_document_by_id("sites", broadcast.siteId)
     if site.get("agencyId") != agency_id:
-        logger.warning(f"Unauthorized broadcast attempt to site {broadcast.siteId} by agency {agency_id}")
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # Find all active attendance records for the site (clocked in, not clocked out)
-    active_attendances = get_documents_by_field("attendance", "siteId", broadcast.siteId)
-    recipients = [
-        attendance["userId"]
-        for attendance in active_attendances
-        if "clockOut" not in attendance or attendance["clockOut"] is None
-    ]
+    notification = SiteNotification(
+        siteId=broadcast.siteId,
+        agencyId=agency_id,
+        senderId=sender_id,
+        text=broadcast.text,
+        createdAt=datetime.utcnow().isoformat() + "Z"
+    )
 
-    if not recipients:
-        logger.info(f"No active users found at site {broadcast.siteId} for broadcast")
-        return {"message": f"No active users found at site {broadcast.siteId}"}
+    doc_ref = db.collection("sites").document(notification.siteId).collection("notifications").document()
+    doc_ref.set(notification.dict())
 
-    # Send message to each recipient
-    sent_messages = []
-    for user_id in recipients:
-        message_data = {
-            "agencyId": agency_id,
-            "senderId": sender_id,
-            "text": broadcast.text
-        }
-        sent_message = add_document("messages", message_data)
-        sent_messages.append(sent_message["id"])
+    return {"message": "Broadcast saved as site notification", "notificationId": doc_ref.id}
+
+@app.get("/mobile/messages/broadcast")
+def get_broadcast_messages(employee_id: str = Query(...)):
+    # Get employee's site
+    employees = get_documents_by_field("employees", "employeeCode", employee_id)
+    if not employees:
+        raise HTTPException(status_code=404, detail="Employee not found")
     
-    logger.info(f"Broadcast message sent to {len(recipients)} users at site {broadcast.siteId}")
-    return {"message": f"Broadcast sent to {len(recipients)} users", "messageIds": sent_messages}
+    employee = employees[0]
+    site_id = employee.get("site")
+    if not site_id:
+        raise HTTPException(status_code=400, detail="Employee is not assigned to any site")
+
+    # Fetch messages sent to that site
+    site_messages = get_documents_by_field("siteMessages", "siteId", site_id)
+    return sorted(site_messages, key=lambda x: x.get("createdAt", ""), reverse=True)
+
+@app.get("/web/messages/broadcast", response_model=List[Message])
+def get_broadcasts_for_agency(agency_id: str = Query(...)):
+    messages = get_documents_by_field("siteMessages", "agencyId", agency_id)
+    messages.sort(key=lambda m: m.get("createdAt", ""), reverse=True)  # Sort newest first
+    return messages
+
+
 
 #####################################################
 # 14. Hourly Report Endpoints
@@ -684,27 +733,42 @@ def optimize_scheduling(site_id: str, agency_id: str = Query(...)):
 @app.post("/web/employee/add")
 def add_employee(employee: EmployeeModel, uid: str = Query(...)):
     data = employee.dict(exclude_unset=True)
-    data["uid"] = uid  # 👈 include Firebase UID for later identification
+    data["uid"] = uid
+    if not data.get("employeeCode"):
+        data["employeeCode"] = f"EMP-{str(uuid.uuid4())[:6].upper()}"
     return add_document("employees", data)
 
-@app.patch("/web/employee/{id}")
-def update_employee(id: str, employee: EmployeeModel, agency_id: str = Query(...)):
-    existing = get_document_by_id("employees", id)
-    if existing["agencyId"] != agency_id:
-        raise HTTPException(403, "Unauthorized")
-    return update_document("employees", id, employee.dict(exclude_unset=True))
 
-@app.delete("/web/employee/{id}")
-def delete_employee(id: str, agency_id: str = Query(...)):
-    existing = get_document_by_id("employees", id)
+@app.patch("/web/employee/{employee_code}")
+def update_employee_by_code(employee_code: str, employee: EmployeeModel, agency_id: str = Query(...)):
+    employees = get_documents_by_field("employees", "employeeCode", employee_code)
+    if not employees:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    existing = employees[0]
     if existing["agencyId"] != agency_id:
         raise HTTPException(403, "Unauthorized")
-    delete_document("employees", id)
+    return update_document("employees", existing["id"], employee.dict(exclude_unset=True))
+
+
+@app.delete("/web/employee/{employee_code}")
+def delete_employee_by_code(employee_code: str, agency_id: str = Query(...)):
+    employees = get_documents_by_field("employees", "employeeCode", employee_code)
+    if not employees:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    existing = employees[0]
+    if existing["agencyId"] != agency_id:
+        raise HTTPException(403, "Unauthorized")
+    delete_document("employees", existing["id"])
     return {"message": "Deleted"}
 
-@app.get("/web/employee/detail/{employee_id}")
-def get_employee(employee_id: str):
-    return get_document_by_id("employees", employee_id)
+
+@app.get("/web/employee/detail/{employee_code}")
+def get_employee_by_code(employee_code: str):
+    employees = get_documents_by_field("employees", "employeeCode", employee_code)
+    if not employees:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return employees[0]
+
 
 @app.get("/web/employee/all")
 def get_all_employees(agency_id: str = Query(...)):
@@ -714,6 +778,35 @@ def get_all_employees(agency_id: str = Query(...)):
 #####################################################
 # 16. Site Endpoints (Enhanced CRUD)
 #####################################################
+
+
+def generate_unique_join_code(length: int = 6) -> str:
+    for _ in range(10):  # Retry up to 10 times
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+        code = f"JOIN-{suffix}"
+        existing = db.collection("joiningCodes").where("code", "==", code).limit(1).stream()
+        if not any(existing):
+            return code
+    raise HTTPException(status_code=500, detail="Unable to generate unique join code")
+
+@app.post("/v1/join-code/generate")
+def generate_join_code(agency_id: str = Query(...)):
+    try:
+        code = generate_unique_join_code()
+        data = {
+            "code": code,
+            "agencyId": agency_id,
+            "used": False,
+            "createdAt": datetime.utcnow().isoformat() + "Z",
+            "usedAt": None,
+            "usedBy": None
+        }
+        saved = add_document("joiningCodes", data)
+        return {"message": "Join code generated", "joinCode": saved["code"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate join code: {str(e)}")
+
+
 
 @app.post("/mobile/hourly-reports", response_model=HourlyReport)
 def submit_hourly_report(report: HourlyReport):
@@ -785,8 +878,6 @@ def mobile_login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail=f"Mobile login failed: {str(e)}")
 
 
-from fastapi import Body, HTTPException
-from pydantic import BaseModel
 
 class EmployeeRegisterPayload(BaseModel):
     idToken: str
@@ -794,39 +885,58 @@ class EmployeeRegisterPayload(BaseModel):
     employee: EmployeeModel
 
 @app.post("/mobile/employee/register")
-def register_employee(input: EmployeeRegisterPayload):
+def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
     try:
-        decoded = auth.verify_id_token(input.idToken)
+        decoded = auth.verify_id_token(payload.idToken)
         uid = decoded["uid"]
 
-        # ✅ Check if employee already exists
+        # Check if employee already exists
         existing = get_documents_by_field("employees", "uid", uid)
         if existing:
             raise HTTPException(status_code=400, detail="Employee already registered")
 
-        # ✅ Find agency via code
-        agency_query = db.collection("agencies").where("code", "==", input.agencyCode).limit(1).stream()
-        agency_doc = next(agency_query, None)
-        if not agency_doc:
-            raise HTTPException(status_code=404, detail="Invalid agency code")
+        # Validate join code
+        join_query = db.collection("joiningCodes") \
+            .where("code", "==", payload.joinCode) \
+            .where("used", "==", False) \
+            .limit(1).stream()
 
-        agency_data = agency_doc.to_dict()
-        agency_id = agency_data["agencyId"]
+        join_doc = next(join_query, None)
+        if not join_doc:
+            raise HTTPException(status_code=400, detail="Invalid or already used join code")
 
-        # ✅ Prepare employee data
-        data = input.employee.dict(exclude_unset=True)
-        data["uid"] = uid
-        data["agencyId"] = agency_id
-        data["status"] = "active"  # default
-        data["createdAt"] = datetime.utcnow().isoformat() + "Z"
-        data["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+        join_data = join_doc.to_dict()
+        agency_id = join_data["agencyId"]
+
+        # Generate random employee code
+        def generate_employee_code(length=6):
+            return "EMP-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+        employee_code = generate_employee_code()
+
+        # Prepare employee data
+        data = payload.employee.dict(exclude={"employeeCode"}, exclude_unset=True)
+        data.update({
+            "uid": uid,
+            "agencyId": agency_id,
+            "status": "active",
+            "createdAt": datetime.utcnow().isoformat() + "Z",
+            "updatedAt": datetime.utcnow().isoformat() + "Z",
+            "employeeCode": employee_code
+        })
 
         new_employee = add_document("employees", data)
+
+        db.collection("joiningCodes").document(join_doc.id).update({
+            "used": True,
+            "usedBy": uid,
+            "usedAt": datetime.utcnow().isoformat() + "Z"
+        })
 
         return {
             "message": "Employee registered successfully",
             "uid": uid,
-            "employeeId": new_employee.get("employeeCode", new_employee["id"]),
+            "employeeId": employee_code,
             "agencyId": agency_id,
             "siteId": new_employee.get("site"),
             "name": new_employee["name"],
@@ -838,12 +948,14 @@ def register_employee(input: EmployeeRegisterPayload):
 
 
 
+
+
 #####################################################
 
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.28 employyee delete edit "
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.30 emplooyee ocde implemented and broadcast"
     }
 
 
