@@ -739,15 +739,17 @@ def add_employee(employee: EmployeeModel, uid: str = Query(...)):
     return add_document("employees", data)
 
 
-@app.patch("/web/employee/{employee_code}")
-def update_employee_by_code(employee_code: str, employee: EmployeeModel, agency_id: str = Query(...)):
-    employees = get_documents_by_field("employees", "employeeCode", employee_code)
-    if not employees:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    existing = employees[0]
-    if existing["agencyId"] != agency_id:
-        raise HTTPException(403, "Unauthorized")
-    return update_document("employees", existing["id"], employee.dict(exclude_unset=True))
+def get_documents_by_field(collection: str, field: str, value: str) -> List[dict]:
+    logger.info(f"Querying {collection} where {field} = {value}")
+    docs = db.collection(collection).stream() if field == "all" else db.collection(collection).where(field, "==", value).stream()
+    result = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id  # 🔥 Include Firestore document ID
+        result.append(data)
+    logger.info(f"Found {len(result)} documents in {collection}")
+    return result
+
 
 
 @app.delete("/web/employee/{employee_code}")
