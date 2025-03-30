@@ -677,8 +677,13 @@ def get_sender_id(authorization: str = Header(...)) -> str:
 def broadcast_message(
     broadcast: BroadcastMessage,
     agency_id: str = Query(...),
-    sender_id: str = Query(..., alias="senderId")
+    authorization: str = Header(...)
 ):
+    # 🔐 Extract sender UID from token
+    sender_id = get_sender_id(authorization)
+
+    # ✅ Optional: Add a lookup here if you want to return/display employeeCode or user name later
+
     site = get_document_by_id("sites", broadcast.siteId)
     if site.get("agencyId") != agency_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -979,7 +984,7 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.30 emplooyee ocde implemented and broadcast"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.31 broadcast via auth"
     }
 
 
