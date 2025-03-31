@@ -678,22 +678,22 @@ def create_message(message: Message):
 
 def get_sender_id(authorization: str = Header(...)) -> str:
     if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token format")
     token = authorization.split(" ")[1]
-    decoded = auth.verify_id_token(token)
-    return decoded["uid"]
+    try:
+        decoded = auth.verify_id_token(token)
+        logger.info(f"[Auth] Token decoded. UID: {decoded['uid']}")
+        return decoded["uid"]
+    except Exception as e:
+        logger.error(f"[Auth] Token decoding failed: {e}")
+        raise HTTPException(status_code=403, detail="Invalid Firebase ID token")
+
 
 @app.post("/v1/messages/broadcast", response_model=Dict[str, str])
 def broadcast_message(
     broadcast: BroadcastMessage,
-    agency_id: str = Query(...),
-    authorization: str = Header(...)
+    agency_id: str = Query(...)
 ):
-    # 🔐 Extract sender UID from token
-    sender_id = get_sender_id(authorization)
-
-    # ✅ Optional: Add a lookup here if you want to return/display employeeCode or user name later
-
     site = get_document_by_id("sites", broadcast.siteId)
     if site.get("agencyId") != agency_id:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -701,7 +701,7 @@ def broadcast_message(
     notification = SiteNotification(
         siteId=broadcast.siteId,
         agencyId=agency_id,
-        senderId=sender_id,
+        senderId="admin",  # ✅ fallback value
         text=broadcast.text,
         createdAt=datetime.utcnow().isoformat() + "Z"
     )
@@ -709,7 +709,13 @@ def broadcast_message(
     doc_ref = db.collection("sites").document(notification.siteId).collection("notifications").document()
     doc_ref.set(notification.dict())
 
-    return {"message": "Broadcast saved as site notification", "notificationId": doc_ref.id}
+    return {
+        "message": "Broadcast saved as site notification",
+        "notificationId": doc_ref.id
+    }
+
+
+
 
 @app.get("/mobile/messages/broadcast")
 def get_broadcast_messages(employee_id: str = Query(...)):
