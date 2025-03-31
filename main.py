@@ -768,12 +768,15 @@ def optimize_scheduling(site_id: str, agency_id: str = Query(...)):
 #####################################################
 
 @app.post("/web/employee/add")
-def add_employee(employee: EmployeeModel, uid: str = Query(...)):
+def add_employee(employee: EmployeeModel):
     data = employee.dict(exclude_unset=True)
-    data["uid"] = uid
+
+    # Do not add uid here, it will be filled during mobile registration
     if not data.get("employeeCode"):
         data["employeeCode"] = f"EMP-{str(uuid.uuid4())[:6].upper()}"
+    
     return add_document("employees", data)
+
 
 
 def get_documents_by_field(collection: str, field: str, value: str) -> List[dict]:
