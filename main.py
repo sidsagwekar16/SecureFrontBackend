@@ -803,6 +803,16 @@ def delete_employee_by_code(employee_code: str, agency_id: str = Query(...)):
     delete_document("employees", existing["id"])
     return {"message": "Deleted"}
 
+@app.patch("/web/employee/{employee_code}")
+def update_employee_by_code(employee_code: str, employee: EmployeeModel, agency_id: str = Query(...)):
+    employees = get_documents_by_field("employees", "employeeCode", employee_code)
+    if not employees:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    existing = employees[0]
+    if existing["agencyId"] != agency_id:
+        raise HTTPException(403, "Unauthorized")
+    return update_document("employees", existing["id"], employee.dict(exclude_unset=True))
+
 
 @app.get("/web/employee/detail/{employee_code}")
 def get_employee_by_code(employee_code: str):
