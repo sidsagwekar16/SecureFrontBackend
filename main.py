@@ -141,12 +141,18 @@ class UserAgencyMapping(BaseModel):
 class LoginRequest(BaseModel):
     idToken: str
 
+
 class AgencyCreate(BaseModel):
     name: str
     contactEmail: str
     contactPhone: str
     address: str
     subscriptionPlan: str
+
+class CompleteSignupPayload(BaseModel):
+    idToken: str
+    agency: AgencyCreate
+
 
 class Agency(AgencyCreate):
     agencyId: str
@@ -278,7 +284,7 @@ class JoinCode(BaseModel):
 
 class EmployeeModel(BaseModel):
     name: str
-    employeeCode: str
+    employeeCode: Optional[str] = None 
     role: Optional[str] = None 
     status: Optional[str] = None 
     site: Optional[str] = None 
@@ -353,10 +359,13 @@ def logout_user():
 
     
 @app.post("/auth/complete-signup")
-def complete_signup(payload: LoginRequest, agency: AgencyCreate):
+def complete_signup(payload: CompleteSignupPayload):
     try:
+        if payload.idToken.count('.') != 2:
+            raise HTTPException(400, "Invalid Firebase ID token format")
+
         decoded_token = auth.verify_id_token(payload.idToken)
-        uid = decoded_token['uid']
+        uid = decoded_token["uid"]
 
         # Check if this user already has an agency
         user_doc = db.collection("users").document(uid).get()
@@ -364,11 +373,11 @@ def complete_signup(payload: LoginRequest, agency: AgencyCreate):
             raise HTTPException(status_code=400, detail="User already linked to an agency")
 
         # ✅ Create agency
-        agency_data = agency.dict()
+        agency_data = payload.agency.dict()
         agency_data["ownerId"] = uid
         new_agency = add_document("agencies", agency_data)
 
-        # ✅ Link user to agency in Firestore (you can later move this to custom claims if needed)
+        # ✅ Link user to agency in Firestore
         db.collection("users").document(uid).set({
             "agencyId": new_agency["agencyId"]
         })
@@ -377,6 +386,7 @@ def complete_signup(payload: LoginRequest, agency: AgencyCreate):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Signup failed: {str(e)}")
+
     
 ###################################################
 # 🧠 OPTIONAL: Helper to auto-fetch agencyId from user
