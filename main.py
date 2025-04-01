@@ -799,27 +799,17 @@ def get_documents_by_field(collection: str, field: str, value: str) -> List[dict
 
 
 @app.get("/v1/employees/{employee_id}")
-def get_employee_by_id(employee_id: str, agency_id: str = Query(...)):
-    employee = get_document_by_id("employees", employee_id)
-    if employee.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return employee
+def get_employee_by_id(employee_id: str):
+    return get_document_by_id("employees", employee_id)
 
 @app.patch("/v1/employees/{employee_id}")
-def update_employee_by_id(employee_id: str, employee: EmployeeModel, agency_id: str = Query(...)):
-    existing = get_document_by_id("employees", employee_id)
-    if existing.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+def update_employee_by_id(employee_id: str, employee: EmployeeModel):
     return update_document("employees", employee_id, employee.dict(exclude_unset=True))
 
 @app.delete("/v1/employees/{employee_id}")
-def delete_employee_by_id(employee_id: str, agency_id: str = Query(...)):
-    existing = get_document_by_id("employees", employee_id)
-    if existing.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+def delete_employee_by_id(employee_id: str):
     delete_document("employees", employee_id)
     return {"message": "Deleted"}
-
 
 
 @app.get("/web/employee/all")
