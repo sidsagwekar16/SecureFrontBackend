@@ -167,7 +167,7 @@ class Site(BaseModel):
     description: str
     address: str
     assignedHours: int
-    location: Dict[str, float]
+    coordinates: Optional[List[Dict[str, float]]] = []
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
