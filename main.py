@@ -798,34 +798,28 @@ def get_documents_by_field(collection: str, field: str, value: str) -> List[dict
 
 
 
-@app.delete("/web/employee/{employee_code}")
-def delete_employee_by_code(employee_code: str, agency_id: str = Query(...)):
-    employees = get_documents_by_field("employees", "employeeCode", employee_code)
-    if not employees:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    existing = employees[0]
-    if existing["agencyId"] != agency_id:
-        raise HTTPException(403, "Unauthorized")
-    delete_document("employees", existing["id"])
+@app.get("/v1/employees/{employee_id}")
+def get_employee_by_id(employee_id: str, agency_id: str = Query(...)):
+    employee = get_document_by_id("employees", employee_id)
+    if employee.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return employee
+
+@app.patch("/v1/employees/{employee_id}")
+def update_employee_by_id(employee_id: str, employee: EmployeeModel, agency_id: str = Query(...)):
+    existing = get_document_by_id("employees", employee_id)
+    if existing.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return update_document("employees", employee_id, employee.dict(exclude_unset=True))
+
+@app.delete("/v1/employees/{employee_id}")
+def delete_employee_by_id(employee_id: str, agency_id: str = Query(...)):
+    existing = get_document_by_id("employees", employee_id)
+    if existing.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    delete_document("employees", employee_id)
     return {"message": "Deleted"}
 
-@app.patch("/web/employee/{employee_code}")
-def update_employee_by_code(employee_code: str, employee: EmployeeModel, agency_id: str = Query(...)):
-    employees = get_documents_by_field("employees", "employeeCode", employee_code)
-    if not employees:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    existing = employees[0]
-    if existing["agencyId"] != agency_id:
-        raise HTTPException(403, "Unauthorized")
-    return update_document("employees", existing["id"], employee.dict(exclude_unset=True))
-
-
-@app.get("/web/employee/detail/{employee_code}")
-def get_employee_by_code(employee_code: str):
-    employees = get_documents_by_field("employees", "employeeCode", employee_code)
-    if not employees:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    return employees[0]
 
 
 @app.get("/web/employee/all")
