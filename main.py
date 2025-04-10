@@ -5,20 +5,27 @@
 ##############################################
 
 import logging
+import firebase_admin.messaging as messaging
 from typing import Annotated
 from datetime import datetime
+from fastapi.responses import StreamingResponse
 from fastapi import Header, Depends
 from typing import List, Dict, Optional
+import io
+import csv
 from firebase_admin import auth
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from firebase_admin import credentials, initialize_app, firestore
 from shapely.geometry import Point, Polygon
 from pydantic import BaseModel, constr
+from datetime import timezone
 from typing import Optional
 import uuid
+from firebase_admin import firestore
 import random
+from typing import List
 import string
 
 # Configure logging
@@ -129,6 +136,29 @@ def validate_geofence_coordinates(coordinates: List[Dict[str, float]]) -> None:
     except Exception as e:
         logger.error(f"Invalid geofence coordinates: {str(e)}")
         raise HTTPException(status_code=400, detail="Invalid geofence coordinates: unable to form a valid polygon")
+    
+    
+
+    #send push helper   
+
+def send_push(uid: str, title: str, body: str, data: dict = {}):
+    doc = db.collection("devices").document(uid).get()
+    if not doc.exists:
+        logger.warning(f"No device tokens found for {uid}")
+        return
+
+    tokens = doc.to_dict().get("tokens", [])
+    if not tokens:
+        return
+
+    message = messaging.MulticastMessage(
+        notification=messaging.Notification(title=title, body=body),
+        data=data,
+        tokens=tokens
+    )
+
+    response = messaging.send_multicast(message)
+    logger.info(f"Sent notification to {len(tokens)} devices: {response.success_count} success")
 
 #####################################################
 # 3. Pydantic Models
@@ -235,13 +265,18 @@ class Attendance(BaseModel):
     agencyId: str
     userId: str
     siteId: str
-    clockIn: str
+    clockIn: Optional[str] = None
     clockOut: Optional[str] = None
+    scheduledStart: Optional[str] = None
+    shiftId: Optional[str] = None
+    hoursWorked: Optional[float] = 0
+    overtimeHours: Optional[float] = 0
     breakPeriods: Optional[List[BreakPeriod]] = []
     lat: Optional[float] = None
     lng: Optional[float] = None
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
+
 
 class Message(BaseModel):
     messageId: Optional[str] = None
@@ -288,6 +323,7 @@ class EmployeeModel(BaseModel):
     role: Optional[str] = None 
     status: Optional[str] = None 
     site: Optional[str] = None 
+    assignedsiteID: Optional[str] = None 
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
@@ -624,45 +660,483 @@ def create_billing(billing: Billing):
 # 12. Attendance Endpoints
 #####################################################
 
+from fastapi import APIRouter, HTTPException, Query
+from datetime import datetime, timezone
+from typing import List
+from firebase_admin import firestore
+
+
+
+
+@app.post("/v1/attendance/mark-absentees")
+def mark_absentees(
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    agency_id: str = Query(...)
+):
+    try:
+        target_date = datetime.fromisoformat(date).date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    now = datetime.now(timezone.utc)
+    marked = []
+
+    # Fetch shifts for the date and agency
+    shifts = db.collection("shifts").where("agencyId", "==", agency_id).stream()
+
+    for shift_doc in shifts:
+        shift = shift_doc.to_dict()
+        shift_id = shift_doc.id
+
+        shift_start = datetime.fromisoformat(shift["shiftStart"].replace("Z", "+00:00"))
+        shift_end = datetime.fromisoformat(shift["shiftEnd"].replace("Z", "+00:00"))
+
+        if shift_start.date() != target_date:
+            continue
+
+        if now < shift_end:
+            continue  # Shift not yet over
+
+        # Check if any attendance exists
+        existing_attendance = db.collection("attendance") \
+            .where("shiftId", "==", shift_id) \
+            .limit(1).stream()
+
+        if any(existing_attendance):
+            continue  # Already present or marked
+
+        # Create absent record
+        timestamp = now.isoformat().replace("+00:00", "Z")
+        absent_record = {
+            "agencyId": shift["agencyId"],
+            "userId": shift["employeeId"],
+            "siteId": shift["siteId"],
+            "shiftId": shift_id,
+            "status": "absent",
+            "clockIn": None,
+            "clockOut": None,
+            "hoursWorked": 0,
+            "overtimeHours": 0,
+            "createdAt": timestamp,
+            "updatedAt": timestamp
+        }
+
+        db.collection("attendance").add(absent_record)
+        marked.append(absent_record)
+
+    return {
+        "success": True,
+        "message": f"{len(marked)} absentees marked for {date}",
+        "absentees": marked
+    }
+
+
+@app.post("/v1/attendance/start-break", response_model=Attendance)
+def start_break(attendanceId: str):
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    attendance = get_document_by_id("attendance", attendanceId)
+
+    if not attendance:
+        raise HTTPException(status_code=404, detail="Attendance not found")
+
+    break_periods = attendance.get("breakPeriods", [])
+
+    # Check for active break
+    if any(bp.get("breakEnd") is None for bp in break_periods):
+        raise HTTPException(status_code=400, detail="A break is already in progress")
+
+    break_periods.append({"breakStart": now_str, "breakEnd": None})
+
+    updated = update_document("attendance", attendanceId, {
+        "breakPeriods": break_periods,
+        "updatedAt": now_str
+    })
+
+    return updated
+
+
+@app.post("/v1/attendance/end-break", response_model=Attendance)
+def end_break(attendanceId: str):
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    attendance = get_document_by_id("attendance", attendanceId)
+
+    if not attendance:
+        raise HTTPException(status_code=404, detail="Attendance not found")
+
+    break_periods = attendance.get("breakPeriods", [])
+    for bp in reversed(break_periods):
+        if bp.get("breakEnd") is None:
+            bp["breakEnd"] = now_str
+            break
+    else:
+        raise HTTPException(status_code=400, detail="No active break to end")
+
+    updated = update_document("attendance", attendanceId, {
+        "breakPeriods": break_periods,
+        "updatedAt": now_str
+    })
+
+    return updated
+
 @app.get("/v1/attendance", response_model=List[Attendance])
 def read_attendance(agency_id: str = Query(...)):
     return get_documents_by_field("attendance", "agencyId", agency_id)
 
 @app.post("/v1/attendance/clockin", response_model=Attendance)
 def clock_in(attendance: Attendance):
+    from datetime import datetime, timedelta
+
     data = attendance.dict(exclude_unset=True)
+    user_id = data["userId"]
+    agency_id = data["agencyId"]
+    site_id = data["siteId"]
+    now = datetime.now(timezone.utc)
+    now_str = now.isoformat().replace("+00:00", "Z")
+
+    # Check geolocation
     if "lat" not in data or "lng" not in data:
         raise HTTPException(status_code=400, detail="Latitude and longitude are required for clock-in")
-    geofences = get_documents_by_field("geofences", "siteId", data["siteId"])
-    if not geofences:
-        raise HTTPException(status_code=404, detail=f"No geofences found for site {data['siteId']}")
-    user_inside_geofence = False
-    for geofence in geofences:
-        if is_inside_geofence(data["lat"], data["lng"], geofence["coordinates"]):
-            user_inside_geofence = True
-            logger.info(f"User {data['userId']} is inside geofence {geofence['geoFenceId']} for site {data['siteId']}")
-            break
-    if not user_inside_geofence:
-        logger.warning(f"User {data['userId']} is outside all geofences for site {data['siteId']}")
-        raise HTTPException(status_code=403, detail="User is outside the geofence for this site")
-    logger.info(f"Clock-in successful for user {data['userId']} at site {data['siteId']}")
-    return add_document("attendance", data)
 
-@app.post("/v1/attendance/clockout", response_model=Attendance)
-def clock_out(attendance_id: str = Query(..., alias="attendanceId"), agency_id: str = Query(...)):
-    attendance = get_document_by_id("attendance", attendance_id)
-    if attendance.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return update_document("attendance", attendance_id, {"clockOut": datetime.utcnow().isoformat() + "Z"})
+    # ✅ Load geofence from site
+    site = get_document_by_id("sites", site_id)
+    coordinates = site.get("coordinates", [])
 
-@app.post("/v1/attendance/break", response_model=Attendance)
-def add_break(attendance_id: str, break_start: str, break_end: Optional[str] = None, agency_id: str = Query(...)):
-    doc = get_document_by_id("attendance", attendance_id)
-    if doc.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    break_periods = doc.get("breakPeriods", [])
-    break_periods.append({"breakStart": break_start, "breakEnd": break_end})
-    return update_document("attendance", attendance_id, {"breakPeriods": break_periods})
+    if not coordinates or len(coordinates) < 3:
+        raise HTTPException(status_code=404, detail=f"No valid geofence coordinates defined for site {site_id}")
+
+    inside = is_inside_geofence(data["lat"], data["lng"], coordinates)
+    if not inside:
+        raise HTTPException(status_code=403, detail="You are outside the geofence for this site")
+
+    # Prevent multiple clock-ins today
+    today = now.date()   
+    start = datetime.combine(today, datetime.min.time()).isoformat() + "Z"
+    end = datetime.combine(today, datetime.max.time()).isoformat() + "Z"
+
+    existing = db.collection("attendance") \
+        .where("userId", "==", user_id) \
+        .where("clockIn", ">=", start) \
+        .where("clockIn", "<=", end) \
+        .limit(1).stream()
+
+    if any(existing):
+        raise HTTPException(status_code=409, detail="Already clocked in today")
+
+    # ⏰ REQUIRED: Find a valid shift — fail if not found
+    shift_id = None
+    scheduled_start = None
+
+    potential_shifts = db.collection("shifts") \
+        .where("employeeId", "==", user_id) \
+        .where("siteId", "==", site_id) \
+        .where("agencyId", "==", agency_id).stream()
+
+    shifts_today = []
+    for shift_doc in potential_shifts:
+        shift = shift_doc.to_dict()
+        shift_start = datetime.fromisoformat(shift["shiftStart"].replace("Z", "+00:00"))
+        shift_end = datetime.fromisoformat(shift["shiftEnd"].replace("Z", "+00:00"))
+        if shift_start.date() == today:
+            shifts_today.append((shift_doc.id, shift, shift_start, shift_end))
+
+    # Find the best shift for now
+    best_shift = None
+    min_delta = timedelta(hours=24)
+
+    for sid, sdata, sstart, send in shifts_today:
+        if sstart - timedelta(minutes=30) <= now <= send + timedelta(minutes=15):
+            delta = abs(now - sstart)
+            if delta < min_delta:
+                best_shift = (sid, sdata, sstart)
+                min_delta = delta
+
+    # ❌ Block clock-in if no matching shift
+    if not best_shift:
+        raise HTTPException(status_code=403, detail="You do not have a scheduled shift to clock in for")
+
+    shift_id = best_shift[0]
+    scheduled_start = best_shift[2].isoformat() + "Z"
+
+    # ✅ Build attendance record
+    record = {
+        "agencyId": agency_id,
+        "userId": user_id,
+        "siteId": site_id,
+        "clockIn": now_str,
+        "lat": data["lat"],
+        "lng": data["lng"],
+        "shiftId": shift_id,
+        "scheduledStart": scheduled_start,
+        "createdAt": now_str,
+        "updatedAt": now_str
+    }
+
+    saved = add_document("attendance", record)
+
+    logger.info("Clock-in success", extra={"userId": user_id, "siteId": site_id, "shiftId": shift_id})
+
+    return saved
+
+
+
+
+
+@app.post("/v1/attendance/clockout")
+def clock_out(attendanceId: str):
+    now = datetime.now(timezone.utc)
+    now_str = now.isoformat().replace("+00:00", "Z")
+
+    # 🟡 Fetch attendance record
+    attendance = get_document_by_id("attendance", attendanceId)
+    if not attendance:
+        raise HTTPException(status_code=404, detail="Attendance record not found")
+
+    if attendance.get("clockOut"):
+        raise HTTPException(status_code=400, detail="Already clocked out")
+
+    # 🧠 Handle Z/+00:00 conflicts
+    raw_clock_in = attendance["clockIn"]
+    if raw_clock_in.endswith("Z") and "+00:00" in raw_clock_in:
+        raw_clock_in = raw_clock_in.replace("Z", "")
+
+    clock_in_time = datetime.fromisoformat(raw_clock_in)
+
+    # 🕒 Handle breaks
+    break_minutes = 0
+    for b in attendance.get("breakPeriods", []):
+        start_raw = b.get("breakStart")
+        end_raw = b.get("breakEnd")
+        if not end_raw:
+            continue
+
+        if start_raw.endswith("Z") and "+00:00" in start_raw:
+            start_raw = start_raw.replace("Z", "")
+        if end_raw.endswith("Z") and "+00:00" in end_raw:
+            end_raw = end_raw.replace("Z", "")
+
+        start = datetime.fromisoformat(start_raw)
+        end = datetime.fromisoformat(end_raw)
+        break_minutes += (end - start).total_seconds() / 60
+
+    total_minutes = (now - clock_in_time).total_seconds() / 60 - break_minutes
+    hours_worked = round(total_minutes / 60, 2)
+    overtime_hours = 0
+
+    # 🟢 Check shift and calculate overtime
+    shift_id = attendance.get("shiftId")
+    if shift_id:
+        shift = get_document_by_id("shifts", shift_id)
+        if shift:
+            shift_start = datetime.fromisoformat(shift["shiftStart"].replace("Z", "+00:00"))
+            shift_end = datetime.fromisoformat(shift["shiftEnd"].replace("Z", "+00:00"))
+            scheduled_hours = (shift_end - shift_start).total_seconds() / 3600
+            overtime_hours = round(max(0, hours_worked - scheduled_hours), 2)
+
+            # ✅ Mark shift as completed
+            update_document("shifts", shift_id, {
+                "status": "completed",
+                "updatedAt": now_str
+            })
+
+    # ✏️ Update attendance
+    update_document("attendance", attendanceId, {
+        "clockOut": now_str,
+        "hoursWorked": hours_worked,
+        "overtimeHours": overtime_hours,
+        "updatedAt": now_str
+    })
+
+    logger.info("Clock-out success", extra={
+        "attendanceId": attendanceId,
+        "userId": attendance["userId"],
+        "siteId": attendance["siteId"],
+        "hoursWorked": hours_worked,
+        "overtimeHours": overtime_hours
+    })
+
+    return {
+        "success": True,
+        "message": "Clock-out successful",
+        "data": {
+            "clockOut": now_str,
+            "hoursWorked": hours_worked,
+            "overtimeHours": overtime_hours
+        }
+    }
+
+
+#####################################################
+# 13. time sheets 
+#####################################################
+@app.get("/v1/timesheets")
+def get_timesheets(
+    agency_id: str = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    employee_id: str = Query(None),
+    site_id: str = Query(None)
+):
+    from datetime import datetime
+
+    def parse_utc(dt_str: str) -> datetime:
+        if dt_str.endswith("Z") and "+00:00" in dt_str:
+            dt_str = dt_str.replace("Z", "")
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
+    start = datetime.fromisoformat(start_date).date()
+    end = datetime.fromisoformat(end_date).date()
+
+    employees = {e["id"]: e for e in get_documents_by_field("employees", "agencyId", agency_id)}
+    sites = {s["id"]: s for s in get_documents_by_field("sites", "agencyId", agency_id)}
+    shifts = get_documents_by_field("shifts", "agencyId", agency_id)
+
+    timesheet = []
+
+    for shift in shifts:
+        shift_start = parse_utc(shift["shiftStart"])
+        shift_end = parse_utc(shift["shiftEnd"])
+        shift_date = shift_start.date()
+
+        if not (start <= shift_date <= end):
+            continue
+        if employee_id and shift["employeeId"] != employee_id:
+            continue
+        if site_id and shift["siteId"] != site_id:
+            continue
+
+        emp = employees.get(shift["employeeId"], {})
+        site = sites.get(shift["siteId"], {})
+
+        attendance = db.collection("attendance").where("shiftId", "==", shift["id"]).limit(1).stream()
+        record = next(attendance, None)
+
+        entry = {
+            "shiftId": shift["id"],
+            "employeeId": shift["employeeId"],
+            "employeeName": emp.get("name", "Unknown"),
+            "siteName": site.get("name", "Unknown"),
+            "date": str(shift_date),
+            "shiftStart": shift["shiftStart"],
+            "shiftEnd": shift["shiftEnd"],
+            "clockIn": None,
+            "clockOut": None,
+            "hoursWorked": 0,
+            "overtimeHours": 0,
+            "status": "Absent"
+        }
+
+        if record:
+            r = record.to_dict()
+            entry["clockIn"] = r.get("clockIn")
+            entry["clockOut"] = r.get("clockOut")
+            entry["hoursWorked"] = r.get("hoursWorked", 0)
+            entry["overtimeHours"] = r.get("overtimeHours", 0)
+
+            if entry["clockIn"]:
+                ci = parse_utc(entry["clockIn"])
+                sched = parse_utc(shift["shiftStart"])
+                entry["status"] = "Late" if ci > sched else "Present"
+
+        timesheet.append(entry)
+
+    return {
+        "success": True,
+        "count": len(timesheet),
+        "data": timesheet
+    }
+
+
+
+
+
+@app.get("/v1/timesheets/export")
+def export_timesheets(
+    agency_id: str = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    employee_id: str = Query(None),
+    site_id: str = Query(None)
+):
+    def parse_utc(dt_str: str) -> datetime:
+        if not dt_str:
+            return None
+        if dt_str.endswith("Z") and "+00:00" in dt_str:
+            dt_str = dt_str.replace("Z", "")
+        try:
+            return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def format_datetime(dt: datetime) -> str:
+        return dt.strftime("%d-%m-%Y %H:%M") if dt else ""
+
+    # Fetch timesheet data
+    data = get_timesheets(
+        agency_id=agency_id,
+        start_date=start_date,
+        end_date=end_date,
+        employee_id=employee_id,
+        site_id=site_id
+    )["data"]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "Employee Name", "Employee Code", "Site",
+        "Date", "Shift Start", "Shift End",
+        "Clock In", "Clock Out",
+        "Scheduled Hours", "Break Minutes",
+        "Hours Worked", "Overtime Hours", "Status", "Remarks"
+    ])
+    writer.writeheader()
+
+    for row in data:
+        scheduled_start = parse_utc(row.get("shiftStart"))
+        scheduled_end = parse_utc(row.get("shiftEnd"))
+        clock_in = parse_utc(row.get("clockIn"))
+        clock_out = parse_utc(row.get("clockOut"))
+
+        scheduled_hours = round((scheduled_end - scheduled_start).total_seconds() / 3600, 2) if scheduled_start and scheduled_end else 0
+
+        # Fetch break time
+        break_minutes = 0
+        attendance = db.collection("attendance").where("shiftId", "==", row["shiftId"]).limit(1).stream()
+        record = next(attendance, None)
+        if record:
+            att = record.to_dict()
+            for b in att.get("breakPeriods", []):
+                bs = parse_utc(b.get("breakStart"))
+                be = parse_utc(b.get("breakEnd"))
+                if bs and be:
+                    break_minutes += (be - bs).total_seconds() / 60
+
+        # Load employeeCode
+        emp = get_document_by_id("employees", row.get("employeeId", "")) if row.get("employeeId") else {}
+        emp_code = emp.get("employeeCode", "")
+
+        writer.writerow({
+            "Employee Name": row.get("employeeName", ""),
+            "Employee Code": emp_code,
+            "Site": row.get("siteName", ""),
+            "Date": row.get("date", ""),
+            "Shift Start": format_datetime(scheduled_start),
+            "Shift End": format_datetime(scheduled_end),
+            "Clock In": format_datetime(clock_in),
+            "Clock Out": format_datetime(clock_out),
+            "Scheduled Hours": scheduled_hours,
+            "Break Minutes": round(break_minutes),
+            "Hours Worked": row.get("hoursWorked", 0),
+            "Overtime Hours": row.get("overtimeHours", 0),
+            "Status": row.get("status", ""),
+            "Remarks": ""
+        })
+
+    output.seek(0)
+    filename = f"timesheet_{start_date}_to_{end_date}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 #####################################################
 # 13. Message Endpoints (Including Broadcast)
@@ -764,10 +1238,164 @@ def delete_hourly_report(report_id: str, agency_id: str = Query(...)):
 #####################################################
 # 15. Scheduling Endpoint
 #####################################################
+from datetime import datetime, timezone
 
-@app.post("/web/scheduling/optimize")
-def optimize_scheduling(site_id: str, agency_id: str = Query(...)):
-    return {"message": "Scheduling optimization is not fully implemented in single-file mode."}
+def parse_utc(dt_str: str) -> datetime:
+    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
+def check_shift_conflict(employee_id: str, new_start: str, new_end: str, exclude_shift_id: Optional[str] = None) -> bool:
+    new_start_dt = parse_utc(new_start)
+    new_end_dt = parse_utc(new_end)
+
+    shifts = db.collection("shifts").where("employeeId", "==", employee_id).stream()
+    for shift in shifts:
+        data = shift.to_dict()
+        if exclude_shift_id and shift.id == exclude_shift_id:
+            continue  # skip the shift being updated
+
+        existing_start = parse_utc(data["shiftStart"])
+        existing_end = parse_utc(data["shiftEnd"])
+
+        # Check overlap
+        if (existing_start < new_end_dt) and (new_start_dt < existing_end):
+            return True
+    return False
+
+
+@app.get("/v1/calendar/shifts")
+def get_calendar_shifts(agency_id: str = Query(...), start_date: str = Query(...), end_date: str = Query(...)):
+    """Get shifts formatted for FullCalendar"""
+    shifts = get_documents_by_field("shifts", "agencyId", agency_id)
+    
+    # Filter by date range
+    start = datetime.fromisoformat(start_date.rstrip("Z"))
+    end = datetime.fromisoformat(end_date.rstrip("Z"))
+    
+    filtered_shifts = []
+    for shift in shifts:
+        shift_start = datetime.fromisoformat(shift["shiftStart"].rstrip("Z"))
+        shift_end = datetime.fromisoformat(shift["shiftEnd"].rstrip("Z"))
+        
+        if (shift_start >= start and shift_start <= end) or (shift_end >= start and shift_end <= end):
+            filtered_shifts.append(shift)
+    
+    # Format for FullCalendar
+    calendar_events = []
+    for shift in filtered_shifts:
+        employee_id = shift["employeeId"]
+        employee = get_document_by_id("employees", employee_id)
+        site_id = shift["siteId"]
+        site = get_document_by_id("sites", site_id)
+        
+        calendar_events.append({
+            "id": shift["id"],
+            "title": f"{employee['name']} - {site['name']}",
+            "start": shift["shiftStart"],
+            "end": shift["shiftEnd"],
+            "extendedProps": {
+                "employeeId": employee_id,
+                "employeeName": employee["name"],
+                "siteId": site_id,
+                "siteName": site["name"]
+            }
+        })
+    
+    return calendar_events
+
+
+@app.post("/v1/calendar/shifts")
+def create_calendar_shift(
+    employee_id: str = Body(...),
+    site_id: str = Body(...),
+    start: str = Body(...),
+    end: str = Body(...),
+    agency_id: str = Body(...)
+):
+    """Create a shift from calendar UI"""
+
+    # ✅ Conflict check
+    if check_shift_conflict(employee_id, start, end):
+        raise HTTPException(
+            status_code=409,
+            detail="Shift conflict: Employee already has a shift during this time."
+        )
+
+    shift = Shift(
+        agencyId=agency_id,
+        employeeId=employee_id,
+        siteId=site_id,
+        shiftStart=start,
+        shiftEnd=end
+    )
+    
+    result = add_document("shifts", shift.dict(exclude_unset=True))
+    
+    employee = get_document_by_id("employees", employee_id)
+    site = get_document_by_id("sites", site_id)
+    
+    return {
+        "id": result["id"],
+        "title": f"{employee['name']} - {site['name']}",
+        "start": result["shiftStart"],
+        "end": result["shiftEnd"],
+        "extendedProps": {
+            "employeeId": employee_id,
+            "employeeName": employee["name"],
+            "siteId": site_id,
+            "siteName": site["name"]
+        }
+    }
+
+
+@app.put("/v1/calendar/shifts/{shift_id}")
+def update_calendar_shift(
+    shift_id: str,
+    start: str = Body(...),
+    end: str = Body(...),
+    employee_id: Optional[str] = Body(None),
+    site_id: Optional[str] = Body(None),
+    agency_id: str = Query(...)
+):
+    """Update shift times or assignment from calendar dragging/resizing"""
+    shift = get_document_by_id("shifts", shift_id)
+    if shift.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    emp_id_to_check = employee_id if employee_id else shift["employeeId"]
+
+    # ✅ Conflict check
+    if check_shift_conflict(emp_id_to_check, start, end, exclude_shift_id=shift_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Shift conflict: Employee already has a shift during this time."
+        )
+
+    update_data = {
+        "shiftStart": start,
+        "shiftEnd": end,
+    }
+    if employee_id:
+        update_data["employeeId"] = employee_id
+    if site_id:
+        update_data["siteId"] = site_id
+
+    result = update_document("shifts", shift_id, update_data)
+
+    employee = get_document_by_id("employees", result["employeeId"])
+    site = get_document_by_id("sites", result["siteId"])
+
+    return {
+        "id": shift_id,
+        "title": f"{employee['name']} - {site['name']}",
+        "start": result["shiftStart"],
+        "end": result["shiftEnd"],
+        "extendedProps": {
+            "employeeId": result["employeeId"],
+            "employeeName": employee["name"],
+            "siteId": result["siteId"],
+            "siteName": site["name"]
+        }
+    }
 
 #####################################################
 # 16. Site Endpoints (Enhanced CRUD)
@@ -884,15 +1512,27 @@ def get_open_shifts(agency_id: str = Query(...)):
     shifts = db.collection("shifts").where("agencyId", "==", agency_id).where("status", "==", "open").stream()
     return [s.to_dict() for s in shifts]
 
+
+#test pending
 @app.patch("/mobile/shifts/{shift_id}/apply")
 def apply_for_shift(shift_id: str, employee_id: str = Query(...)):
     shift = get_document_by_id("shifts", shift_id)
+
     if shift.get("status") != "open" or shift.get("employeeId"):
         raise HTTPException(status_code=400, detail="Shift is not open for application")
+
+    # ✅ Conflict check before applying
+    if check_shift_conflict(employee_id, shift["shiftStart"], shift["shiftEnd"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Shift conflict: You already have a shift during this time."
+        )
+
     return update_document("shifts", shift_id, {
         "employeeId": employee_id,
         "status": "pending"
     })
+
 
 
 @app.post("/mobile/employee/login")
@@ -990,6 +1630,17 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
 
 
 
+## push notficiation module 
+
+#send push helper 
+
+
+
+#register your mobile device 
+
+
+
+
 
 
 #####################################################
@@ -997,7 +1648,7 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.31 broadcast via auth"
+        "message": "Welcome to the SecureFront API by BluOrigin Team v1.3.31 shift conflict resolved"
     }
 
 
