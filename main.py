@@ -295,13 +295,14 @@ class BroadcastMessage(BaseModel):
     text: str
 
 class HourlyReport(BaseModel):
-    reportId: Optional[str] = None
+    id: Optional[str] = None
     agencyId: str
     siteId: str
     userId: str  # 👈 Needed to fetch employee-specific reports
     reportText: str
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
+    
 
 class SiteNotification(BaseModel):
     siteId: str
@@ -1171,7 +1172,12 @@ def get_hourly_reports(agency_id: str = Query(...)):
 
 @app.post("/web/hourly-reports", response_model=HourlyReport)
 def create_hourly_report(report: HourlyReport):
-    return add_document("hourlyReports", report.dict(exclude_unset=True))
+    data = report.dict(exclude_unset=True)
+    saved = add_document("hourlyReports", data)
+    # Patch in the Firestore document ID as reportId
+    db.collection("hourlyReports").document(saved["id"]).update({"reportId": saved["id"]})
+    return saved
+
 
 @app.delete("/web/hourly-reports/{report_id}")
 def delete_hourly_report(report_id: str, agency_id: str = Query(...)):
@@ -1433,6 +1439,7 @@ def bulk_import_employees(employees: List[EmployeeModel] = Body(...)):
 #####################################################
 
 
+
 def generate_unique_join_code(length: int = 6) -> str:
     for _ in range(10):  # Retry up to 10 times
         suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -1463,7 +1470,13 @@ def generate_join_code(agency_id: str = Query(...)):
 
 @app.post("/mobile/hourly-reports", response_model=HourlyReport)
 def submit_hourly_report(report: HourlyReport):
-    return add_document("hourlyReports", report.dict(exclude_unset=True))
+    data = report.dict(exclude_unset=True)
+    saved = add_document("hourlyReports", data)
+
+    # Explicitly include the document ID as reportId
+    saved["reportId"] = saved["id"]
+    return saved
+
 
 @app.get("/mobile/hourly-reports", response_model=List[HourlyReport])
 def get_my_reports(user_id: str = Query(...), agency_id: str = Query(...)):
@@ -1620,6 +1633,29 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
 
 
 #register your mobile device 
+
+##############
+#reports 
+#
+
+@app.get("/mobile/reports", response_model=List[HourlyReport])
+def get_reports_for_employee(employee_id: str = Query(...), agency_id: str = Query(...)):
+    reports = db.collection("hourlyReports") \
+        .where("userId", "==", employee_id) \
+        .where("agencyId", "==", agency_id) \
+        .order_by("createdAt", direction=firestore.Query.DESCENDING) \
+        .stream()
+
+    return [r.to_dict() for r in reports]
+
+@app.get("/mobile/reports/{report_id}", response_model=HourlyReport)
+def get_report_detail(report_id: str, agency_id: str = Query(...)):
+    report = get_document_by_id("hourlyReports", report_id)
+    if report.get("agencyId") != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized access")
+    return report
+
+
 
 
 ##########################################
