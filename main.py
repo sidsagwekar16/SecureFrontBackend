@@ -1648,12 +1648,32 @@ def get_reports_for_employee(employee_id: str = Query(...), agency_id: str = Que
 
     return [r.to_dict() for r in reports]
 
-@app.get("/mobile/reports/{report_id}", response_model=HourlyReport)
-def get_report_detail(report_id: str, agency_id: str = Query(...)):
+@app.get("/mobile/hourly-reports/{report_id}")
+def get_single_hourly_report(report_id: str, agency_id: str = Query(...)):
     report = get_document_by_id("hourlyReports", report_id)
-    if report.get("agencyId") != agency_id:
-        raise HTTPException(status_code=403, detail="Unauthorized access")
-    return report
+
+    if report["agencyId"] != agency_id:
+        raise HTTPException(status_code=403, detail="Unauthorized access to report")
+
+    site = get_document_by_id("sites", report["siteId"])
+    employee = get_document_by_id("employees", report["userId"])
+
+    # Format datetime
+    dt = safe_parse_datetime(report.get("createdAt"))
+    formatted_time = dt.strftime("%b %d, %Y at %#I:%M %p") if dt else None
+
+    return {
+        "reportType": "Hourly Report",
+        "status": "Submitted",
+        "datetime": formatted_time,
+        "location": site["name"],
+        "submittedBy": employee["name"],
+        "reportText": report.get("reportText"),
+        "images": report.get("images", []),
+        "agencyId": agency_id
+    }
+
+
 
 
 
