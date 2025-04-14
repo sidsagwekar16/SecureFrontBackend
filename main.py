@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi import Header, Depends
 from typing import List, Dict, Optional
 import io
+from dateutil.parser import isoparse
 import csv
 from firebase_admin import auth
 from fastapi import FastAPI, HTTPException, Query, Body, APIRouter
@@ -52,6 +53,7 @@ db = firestore.client()
 #####################################################
 # 2. Firestore Helper Functions
 #####################################################
+
 
 def add_document(collection: str, data: dict) -> dict:
     doc_ref = db.collection(collection).document()
@@ -160,6 +162,15 @@ def send_push(uid: str, title: str, body: str, data: dict = {}):
     response = messaging.send_multicast(message)
     logger.info(f"Sent notification to {len(tokens)} devices: {response.success_count} success")
 
+
+def safe_parse_datetime(dt_str: str) -> datetime:
+    try:
+        return isoparse(dt_str)
+    except Exception:
+        return None
+
+
+
 #####################################################
 # 3. Pydantic Models
 #####################################################
@@ -236,14 +247,7 @@ class Incident(BaseModel):
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
-class GeoFence(BaseModel):
-    geoFenceId: Optional[str] = None
-    agencyId: str
-    siteId: str
-    coordinates: List[Dict[str, float]]
-    radius: Optional[float] = None
-    createdAt: Optional[str] = None
-    updatedAt: Optional[str] = None
+
 
 class Billing(BaseModel):
     billingId: Optional[str] = None
@@ -585,64 +589,6 @@ def create_incident(incident: Incident):
 # 10. GeoFence Endpoints
 #####################################################
 
-@app.get("/v1/geofences", response_model=List[GeoFence])
-def read_geofences(agency_id: str = Query(...)):
-    geofences = get_documents_by_field("geofences", "agencyId", agency_id)
-    logger.info(f"Retrieved {len(geofences)} geofences for agency {agency_id}")
-    return geofences
-
-@app.get("/v1/geofences/{geofence_id}", response_model=GeoFence)
-def read_geofence(geofence_id: str, agency_id: str = Query(...)):
-    geofence = get_document_by_id("geofences", geofence_id)
-    if geofence.get("agencyId") != agency_id:
-        logger.warning(f"Unauthorized access attempt to geofence {geofence_id} by agency {agency_id}")
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    logger.info(f"Retrieved geofence {geofence_id} for agency {agency_id}")
-    return geofence
-
-@app.post("/v1/geofences", response_model=GeoFence)
-def create_geofence(geofence: GeoFence):
-    data = geofence.dict(exclude_unset=True)
-    validate_geofence_coordinates(data["coordinates"])
-    result = add_document("geofences", data)
-    logger.info(f"Created geofence {result['id']} for agency {data['agencyId']} and site {data['siteId']}")
-    return result
-
-@app.put("/v1/geofences/{geofence_id}", response_model=GeoFence)
-def update_geofence(geofence_id: str, geofence: GeoFence, agency_id: str = Query(...)):
-    existing_geofence = get_document_by_id("geofences", geofence_id)
-    if existing_geofence.get("agencyId") != agency_id:
-        logger.warning(f"Unauthorized update attempt to geofence {geofence_id} by agency {agency_id}")
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    data = geofence.dict(exclude_unset=True)
-    validate_geofence_coordinates(data["coordinates"])
-    data["geoFenceId"] = geofence_id
-    result = update_document("geofences", geofence_id, data)
-    logger.info(f"Updated geofence {geofence_id} for agency {agency_id}")
-    return result
-
-@app.patch("/v1/geofences/{geofence_id}", response_model=GeoFence)
-def partial_update_geofence(geofence_id: str, geofence: GeoFence, agency_id: str = Query(...)):
-    existing_geofence = get_document_by_id("geofences", geofence_id)
-    if existing_geofence.get("agencyId") != agency_id:
-        logger.warning(f"Unauthorized patch attempt to geofence {geofence_id} by agency {agency_id}")
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    data = geofence.dict(exclude_unset=True, exclude_none=True)
-    if "coordinates" in data:
-        validate_geofence_coordinates(data["coordinates"])
-    result = update_document("geofences", geofence_id, data)
-    logger.info(f"Partially updated geofence {geofence_id} for agency {agency_id}")
-    return result
-
-@app.delete("/v1/geofences/{geofence_id}")
-def delete_geofence(geofence_id: str, agency_id: str = Query(...)):
-    geofence = get_document_by_id("geofences", geofence_id)
-    if geofence.get("agencyId") != agency_id:
-        logger.warning(f"Unauthorized delete attempt to geofence {geofence_id} by agency {agency_id}")
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    delete_document("geofences", geofence_id)
-    logger.info(f"Deleted geofence {geofence_id} for agency {agency_id}")
-    return {"message": f"GeoFence {geofence_id} deleted"}
 
 #####################################################
 # 11. Billing Endpoints
@@ -1398,7 +1344,7 @@ def update_calendar_shift(
     }
 
 #####################################################
-# 16. Site Endpoints (Enhanced CRUD)
+# 16. employee endpoints
 #####################################################
 
 @app.post("/web/employee/add")
@@ -1443,6 +1389,43 @@ def delete_employee_by_id(employee_id: str):
 @app.get("/web/employee/all")
 def get_all_employees(agency_id: str = Query(...)):
     return get_documents_by_field("employees", "agencyId", agency_id)
+
+@app.post("/web/employees/bulk-import")
+def bulk_import_employees(employees: List[EmployeeModel] = Body(...)):
+    batch = db.batch()
+    now = datetime.utcnow().isoformat()
+    imported = 0
+    failed = []
+
+    for emp in employees:
+        try:
+            data = emp.dict(exclude_unset=True)
+
+            if not data.get("employeeCode"):
+                data["employeeCode"] = f"EMP-{str(uuid.uuid4())[:6].upper()}"
+
+            if not data.get("createdAt"):
+                data["createdAt"] = now
+            data["updatedAt"] = now
+
+            # Generate new document reference
+            doc_ref = db.collection("employees").document()
+            batch.set(doc_ref, data)
+            imported += 1
+        except Exception as e:
+            failed.append({"employee": emp.name, "error": str(e)})
+
+    try:
+        batch.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch write failed: {str(e)}")
+
+    return {
+        "success": True,
+        "imported": imported,
+        "failed": failed,
+    }
+
 
 
 #####################################################
@@ -1639,9 +1622,116 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
 #register your mobile device 
 
 
+##########################################
+#mobile api for screens
+##########################################
+@app.get("/mobile/home")
+def get_mobile_home(employee_id: str = Query(...)):
+    now = datetime.now(timezone.utc)
+    today = now.date()
 
+    # 🔍 1. Get employee
+    employee = get_document_by_id("employees", employee_id)
+    site_id = employee.get("assignedsiteID")
+    agency_id = employee.get("agencyId")
 
+    # 🔍 2. Today’s shift
+    shifts = db.collection("shifts") \
+        .where("employeeId", "==", employee_id) \
+        .where("siteId", "==", site_id) \
+        .where("agencyId", "==", agency_id).stream()
 
+    current_shift = None
+    next_shift = None
+
+    # Preload site name once
+    site_name = get_document_by_id("sites", site_id).get("name", "Unknown")
+
+    # Get today's attendance record
+    start_time = datetime.combine(today, datetime.min.time()).isoformat() + "Z"
+    end_time = datetime.combine(today, datetime.max.time()).isoformat() + "Z"
+    attendance_today = list(
+        db.collection("attendance")
+        .where("userId", "==", employee_id)
+        .where("clockIn", ">=", start_time)
+        .where("clockIn", "<=", end_time)
+        .limit(1)
+        .stream()
+    )
+    clocked_in = any(attendance_today)
+    has_clocked_out = any(a.to_dict().get("clockOut") for a in attendance_today)
+
+    for shift_doc in shifts:
+        shift = shift_doc.to_dict()
+        start = safe_parse_datetime(shift.get("shiftStart"))
+        end = safe_parse_datetime(shift.get("shiftEnd"))
+        if not start or not end:
+            continue
+
+        if start.date() == today:
+            # 🚨 Status logic includes clock-out check
+            shift_status = (
+                "Completed" if has_clocked_out
+                else "Ongoing" if start <= now <= end
+                else "Upcoming" if now < start
+                else "Completed"
+            )
+
+            current_shift = {
+                "siteName": site_name,
+                "shiftStart": shift["shiftStart"],
+                "shiftEnd": shift["shiftEnd"],
+                "status": shift_status
+            }
+
+            if start > now:
+                next_shift = start
+
+    # ⏱ 3. Geofence check
+    geofence_status = "outside"
+    lat = employee.get("lat")
+    lng = employee.get("lng")
+    coordinates = get_document_by_id("sites", site_id).get("coordinates", [])
+
+    if lat and lng and coordinates:
+        inside = is_inside_geofence(lat, lng, coordinates)
+        geofence_status = "inside" if inside else "outside"
+
+    # 🕘 4. Recent Activity
+    attendance_logs = db.collection("attendance") \
+        .where("userId", "==", employee_id) \
+        .order_by("clockIn", direction=firestore.Query.DESCENDING) \
+        .limit(4).stream()
+
+    recent_activity = []
+    for record in attendance_logs:
+        data = record.to_dict()
+        clock_in = data.get("clockIn")
+        clock_out = data.get("clockOut")
+        dt = safe_parse_datetime(clock_in)
+
+        if dt:
+            clockout_dt = safe_parse_datetime(clock_out)
+            recent_activity.append({
+                "date": dt.strftime("%b %d, %Y"),
+                "clockIn": dt.strftime("%I:%M %p").lstrip("0"),
+                "clockOut": clockout_dt.strftime("%I:%M %p").lstrip("0") if clockout_dt else None
+            })
+
+    # 🧠 5. Shift status
+    shift_status = {
+        "currentStatus": "On Duty" if clocked_in else "Off Duty",
+        "nextShiftAt": next_shift.isoformat() + "Z" if next_shift else None,
+        "in": str(next_shift - now).split(".")[0] if next_shift else None
+    }
+
+    return {
+        "clockedIn": clocked_in,
+        "currentShift": current_shift,
+        "geofenceStatus": geofence_status,
+        "shiftStatus": shift_status,
+        "recentActivity": recent_activity
+    }
 
 #####################################################
 
