@@ -110,6 +110,15 @@ def update_document(collection: str, doc_id: str, data: dict) -> dict:
     doc_ref.update(data)
     return doc_ref.get().to_dict()
 
+def generate_unique_employee_join_code() -> str:
+    for _ in range(10):
+        code = "JOIN-EMP-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        existing = db.collection("employees").where("joinCode", "==", code).limit(1).stream()
+        if not any(existing):
+            return code
+    raise HTTPException(status_code=500, detail="Failed to generate unique join code")
+
+
 def delete_document(collection: str, doc_id: str):
     if not doc_id:
         raise HTTPException(status_code=400, detail="Document ID is required")
@@ -324,7 +333,9 @@ class JoinCode(BaseModel):
 
 class EmployeeModel(BaseModel):
     name: str
+    uid: Optional[str] = None  # ✅ Add this
     employeeCode: Optional[str] = None 
+    joinCode: Optional[str] = None 
     role: Optional[str] = None 
     status: Optional[str] = None 
     site: Optional[str] = None 
@@ -343,7 +354,7 @@ class EmployeeModel(BaseModel):
 class EmployeeJoinCodeRegisterPayload(BaseModel):
     idToken: str
     joinCode: str
-    employee: EmployeeModel
+   
 
 #####################################################
 # 4. FastAPI Application
@@ -1360,6 +1371,9 @@ def add_employee(employee: EmployeeModel):
     # Do not add uid here, it will be filled during mobile registration
     if not data.get("employeeCode"):
         data["employeeCode"] = f"EMP-{str(uuid.uuid4())[:6].upper()}"
+
+    data["joinCode"] = generate_unique_employee_join_code()
+
     
     return add_document("employees", data)
 
@@ -1567,62 +1581,55 @@ def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
     try:
         decoded = auth.verify_id_token(payload.idToken)
         uid = decoded["uid"]
+        email = decoded.get("email")
 
-        # Check if employee already exists
+        if not email:
+            raise HTTPException(status_code=400, detail="Email not found in Firebase token")
+
+        # 🔍 Check if UID is already linked
         existing = get_documents_by_field("employees", "uid", uid)
         if existing:
             raise HTTPException(status_code=400, detail="Employee already registered")
 
-        # Validate join code
-        join_query = db.collection("joiningCodes") \
-            .where("code", "==", payload.joinCode) \
-            .where("used", "==", False) \
+        # 🔍 Find employee by unique join code
+        emp_query = db.collection("employees") \
+            .where("joinCode", "==", payload.joinCode) \
+            .where("uid", "==", None) \
             .limit(1).stream()
 
-        join_doc = next(join_query, None)
-        if not join_doc:
-            raise HTTPException(status_code=400, detail="Invalid or already used join code")
+        matched_doc = next(emp_query, None)
+        if not matched_doc:
+            raise HTTPException(status_code=404, detail="Invalid or already used join code")
 
-        join_data = join_doc.to_dict()
-        agency_id = join_data["agencyId"]
+        emp_id = matched_doc.id
+        emp_data = matched_doc.to_dict()
+        agency_id = emp_data["agencyId"]
 
-        # Generate random employee code
-        def generate_employee_code(length=6):
-            return "EMP-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-        employee_code = generate_employee_code()
-
-        # Prepare employee data
-        data = payload.employee.dict(exclude={"employeeCode"}, exclude_unset=True)
-        data.update({
+        # ✅ Update employee document
+        updated_data = {
             "uid": uid,
-            "agencyId": agency_id,
+            "email": email,
             "status": "active",
-            "createdAt": datetime.utcnow().isoformat() + "Z",
-            "updatedAt": datetime.utcnow().isoformat() + "Z",
-            "employeeCode": employee_code
-        })
+            "updatedAt": datetime.utcnow().isoformat() + "Z"
+        }
+        db.collection("employees").document(emp_id).update(updated_data)
 
-        new_employee = add_document("employees", data)
-
-        db.collection("joiningCodes").document(join_doc.id).update({
-            "used": True,
-            "usedBy": uid,
-            "usedAt": datetime.utcnow().isoformat() + "Z"
-        })
+        emp_data.update(updated_data)
 
         return {
-            "message": "Employee registered successfully",
+            "message": "Employee successfully registered",
             "uid": uid,
-            "employeeId": employee_code,
-            "agencyId": agency_id,
-            "siteId": new_employee.get("site"),
-            "name": new_employee["name"],
-            "status": new_employee["status"]
+            "employeeId": emp_data["employeeCode"],
+            "agencyId": emp_data["agencyId"],
+            "siteId": emp_data.get("site"),
+            "name": emp_data["name"],
+            "status": emp_data["status"]
         }
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+
+
 
 
 
@@ -1789,6 +1796,103 @@ def get_mobile_home(employee_id: str = Query(...)):
         "recentActivity": recent_activity
     }
 
+
+##############
+#dashboard
+###############
+@app.get("/v1/dashboard/metrics")
+def get_dashboard_metrics(agency_id: str = Query(...)):
+    try:
+        # Load site metadata to map siteId → siteName
+        sites = db.collection("sites").where("agencyId", "==", agency_id).stream()
+        site_name_map = {s.id: s.to_dict().get("name", s.id) for s in sites}
+
+        # Group employees by assignedsiteID
+        employees = db.collection("employees").where("agencyId", "==", agency_id).stream()
+        site_employees = {}
+        all_employees = []
+
+        for doc in employees:
+            data = doc.to_dict()
+            site_id = data.get("assignedsiteID")  # ✅ Correct field
+            if not site_id:
+                continue
+            site_employees.setdefault(site_id, []).append(doc.id)
+            all_employees.append(doc.id)
+
+        # Group today's attendance by siteId, only include clocked-in AND not clocked-out
+        today = datetime.utcnow().date().isoformat()
+        attendance = db.collection("attendance").where("agencyId", "==", agency_id).stream()
+        site_attendance = {}
+        all_attendance = []
+
+        for doc in attendance:
+            data = doc.to_dict()
+            clock_in = data.get("clockIn", "")
+            clock_out = data.get("clockOut")
+
+            if not clock_in or not clock_in.startswith(today):
+                continue
+            if clock_out:  # ✅ Exclude those who have clocked out
+                continue
+
+            site_id = data.get("siteId")
+            if not site_id:
+                continue
+
+            site_attendance.setdefault(site_id, []).append(data)
+            all_attendance.append(data)
+
+        # Group hourly reports by siteId
+        reports = db.collection("hourlyReports").where("agencyId", "==", agency_id).stream()
+        site_reports = {}
+        all_reports = []
+
+        for doc in reports:
+            data = doc.to_dict()
+            site_id = data.get("siteId")
+            if not site_id:
+                continue
+            site_reports[site_id] = site_reports.get(site_id, 0) + 1
+            all_reports.append(data)
+
+        # Aggregate per siteId
+        site_ids = set(site_employees.keys()) | set(site_attendance.keys()) | set(site_reports.keys())
+        metrics = {}
+
+        for site_id in site_ids:
+            emp_count = len(site_employees.get(site_id, []))
+            att_count = len(site_attendance.get(site_id, []))
+            rep_count = site_reports.get(site_id, 0)
+
+            metrics[site_id] = {
+                "attendancePercentage": round((att_count / emp_count) * 100, 1) if emp_count else 0,
+                "activeOnDuty": att_count,
+                "reports": rep_count,
+                "siteName": site_name_map.get(site_id, "Unnamed Site")
+            }
+
+        # Add global summary under "all"
+        metrics["all"] = {
+            "attendancePercentage": round((len(all_attendance) / len(all_employees)) * 100, 1) if all_employees else 0,
+            "activeOnDuty": len(all_attendance),
+            "reports": len(all_reports),
+            "siteName": "All Sites"
+        }
+
+        return {
+            "success": True,
+            "sites": metrics  # ⬅️ now keyed by siteId
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch metrics: {str(e)}")
+
+
+
+
+
+
 #####################################################
 
 @app.get("/")
@@ -1799,15 +1903,5 @@ def root():
 
 
 #####################################################
-# Usage:
-# 1) Place serviceAccountKey.json next to this file
-# 2) pip install fastapi uvicorn firebase-admin shapely
-# 3) python -m uvicorn main:app --reload
-# 4) Test endpoints with curl/Postman:
-#    - POST /v1/sites {"agencyId": "AGENCY001", "name": "Site1", "description": "Test site", "address": "123 St", "assignedHours": 8, "location": {"lat": 19.171, "lng": 72.845}}
-#    - GET /v1/sites/<site_id>?agency_id=<agency_id>
-#    - PUT /v1/sites/<site_id>?agency_id=<agency_id> {"agencyId": "AGENCY001", "name": "Updated Site", ...}
-#    - PATCH /v1/sites/<site_id>?agency_id=<agency_id> {"name": "Patched Site"}
-#    - DELETE /v1/sites/<site_id>?agency_id=<agency_id>
-#    - POST /v1/messages/broadcast?agency_id=AGENCY001&senderId=OPERATOR001 {"siteId": "SITE001", "text": "Emergency: Evacuate immediately"}
+
 #######################################################
