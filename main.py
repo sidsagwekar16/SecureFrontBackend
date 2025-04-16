@@ -1410,7 +1410,7 @@ def delete_employee_by_id(employee_id: str):
 def get_all_employees(agency_id: str = Query(...)):
     return get_documents_by_field("employees", "agencyId", agency_id)
 
-@app.post("/web/employees/bulk-import")
+@app.post("/v1/employees/bulk-import")
 def bulk_import_employees(employees: List[EmployeeModel] = Body(...)):
     batch = db.batch()
     now = datetime.utcnow().isoformat()
@@ -1445,8 +1445,6 @@ def bulk_import_employees(employees: List[EmployeeModel] = Body(...)):
         "imported": imported,
         "failed": failed,
     }
-
-
 
 #####################################################
 # 16. Site Endpoints (Enhanced CRUD)
