@@ -119,6 +119,7 @@ def generate_unique_employee_join_code() -> str:
     raise HTTPException(status_code=500, detail="Failed to generate unique join code")
 
 
+
 def delete_document(collection: str, doc_id: str):
     if not doc_id:
         raise HTTPException(status_code=400, detail="Document ID is required")
@@ -322,13 +323,7 @@ class SiteNotification(BaseModel):
     createdAt: Optional[str] = None
 
 
-class JoinCode(BaseModel):
-    code: str
-    agencyId: str
-    used: bool = False
-    createdAt: Optional[str] = None
-    usedAt: Optional[str] = None
-    usedBy: Optional[str] = None    
+
 
 
 class EmployeeModel(BaseModel):
@@ -339,6 +334,7 @@ class EmployeeModel(BaseModel):
     role: Optional[str] = None 
     status: Optional[str] = None 
     site: Optional[str] = None 
+    joinCodeStatus: Optional[str] = "unused" 
     assignedsiteID: Optional[str] = None 
     email: Optional[str] = None
     phone: Optional[str] = None
@@ -1372,10 +1368,12 @@ def add_employee(employee: EmployeeModel):
     if not data.get("employeeCode"):
         data["employeeCode"] = f"EMP-{str(uuid.uuid4())[:6].upper()}"
 
+    # ✅ Generate join code and mark it as unused
     data["joinCode"] = generate_unique_employee_join_code()
+    data["joinCodeStatus"] = "unused"
 
-    
     return add_document("employees", data)
+
 
 
 
@@ -1452,31 +1450,8 @@ def bulk_import_employees(employees: List[EmployeeModel] = Body(...)):
 
 
 
-def generate_unique_join_code(length: int = 6) -> str:
-    for _ in range(10):  # Retry up to 10 times
-        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-        code = f"JOIN-{suffix}"
-        existing = db.collection("joiningCodes").where("code", "==", code).limit(1).stream()
-        if not any(existing):
-            return code
-    raise HTTPException(status_code=500, detail="Unable to generate unique join code")
 
-@app.post("/v1/join-code/generate")
-def generate_join_code(agency_id: str = Query(...)):
-    try:
-        code = generate_unique_join_code()
-        data = {
-            "code": code,
-            "agencyId": agency_id,
-            "used": False,
-            "createdAt": datetime.utcnow().isoformat() + "Z",
-            "usedAt": None,
-            "usedBy": None
-        }
-        saved = add_document("joiningCodes", data)
-        return {"message": "Join code generated", "joinCode": saved["code"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate join code: {str(e)}")
+
 
 
 
@@ -1576,57 +1551,69 @@ class EmployeeRegisterPayload(BaseModel):
 
 @app.post("/mobile/employee/register")
 def register_with_join_code(payload: EmployeeJoinCodeRegisterPayload):
-    try:
-        decoded = auth.verify_id_token(payload.idToken)
-        uid = decoded["uid"]
-        email = decoded.get("email")
+    decoded = auth.verify_id_token(payload.idToken)
+    uid = decoded["uid"]
+    email = decoded.get("email")
 
-        if not email:
-            raise HTTPException(status_code=400, detail="Email not found in Firebase token")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in Firebase token")
 
-        # 🔍 Check if UID is already linked
-        existing = get_documents_by_field("employees", "uid", uid)
-        if existing:
-            raise HTTPException(status_code=400, detail="Employee already registered")
+    # Check if UID is already linked
+    existing = get_documents_by_field("employees", "uid", uid)
+    if existing:
+        raise HTTPException(status_code=400, detail="Employee already registered")
 
-        # 🔍 Find employee by unique join code
-        emp_query = db.collection("employees") \
-            .where("joinCode", "==", payload.joinCode) \
-            .where("uid", "==", None) \
-            .limit(1).stream()
+    # Match unclaimed employee with joinCode
+    emp_query = db.collection("employees") \
+        .where("joinCode", "==", payload.joinCode) \
+        .stream()
 
-        matched_doc = next(emp_query, None)
-        if not matched_doc:
-            raise HTTPException(status_code=404, detail="Invalid or already used join code")
+    matched_doc = None
+    for doc in emp_query:
+        data = doc.to_dict()
+        if not data.get("uid"):  # uid is None or not present
+            matched_doc = doc
+            break  # ✅ Only break if we find a valid unclaimed doc
 
-        emp_id = matched_doc.id
-        emp_data = matched_doc.to_dict()
-        agency_id = emp_data["agencyId"]
+    if not matched_doc:
+        raise HTTPException(status_code=404, detail="Invalid or already used join code")
 
-        # ✅ Update employee document
-        updated_data = {
-            "uid": uid,
-            "email": email,
-            "status": "active",
-            "updatedAt": datetime.utcnow().isoformat() + "Z"
-        }
-        db.collection("employees").document(emp_id).update(updated_data)
+    emp_id = matched_doc.id
+    emp_data = matched_doc.to_dict()
 
-        emp_data.update(updated_data)
+    updated_data = {
+        "uid": uid,
+        "email": email,
+        "status": "active",
+        "joinCodeStatus": "used",
+        "updatedAt": datetime.utcnow().isoformat() + "Z"
+    }
 
-        return {
-            "message": "Employee successfully registered",
-            "uid": uid,
-            "employeeId": emp_data["employeeCode"],
-            "agencyId": emp_data["agencyId"],
-            "siteId": emp_data.get("site"),
-            "name": emp_data["name"],
-            "status": emp_data["status"]
-        }
+    db.collection("employees").document(emp_id).update(updated_data)
+    emp_data.update(updated_data)
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+    return {
+        "message": "Employee successfully registered",
+        "uid": uid,
+        "employeeId": emp_data["employeeCode"],
+        "agencyId": emp_data["agencyId"],
+        "siteId": emp_data.get("site"),
+        "name": emp_data["name"],
+        "status": emp_data["status"]
+    }
 
+
+
+
+
+@app.post("/web/employee/{employee_id}/reset-join-code")
+def regenerate_join_code(employee_id: str):
+    new_code = generate_unique_employee_join_code()
+    update_document("employees", employee_id, {
+        "joinCode": new_code,
+        "updatedAt": datetime.utcnow().isoformat() + "Z"
+    })
+    return {"success": True, "joinCode": new_code}
 
 
 
