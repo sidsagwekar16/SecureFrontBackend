@@ -5,6 +5,8 @@
 ##############################################
 
 import logging
+from dotenv import load_dotenv
+load_dotenv()
 import firebase_admin.messaging as messaging
 from typing import Annotated
 from datetime import datetime
@@ -28,6 +30,10 @@ from firebase_admin import firestore
 import random
 from typing import List
 import string
+from routes.billing import router as billing_router
+
+
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +60,19 @@ db = firestore.client()
 # 2. Firestore Helper Functions
 #####################################################
 
+def get_stripe_customer_id(user_id: str) -> str:
+    db = firestore.client()
+    doc_ref = db.collection("users").document(user_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        raise Exception("User not found")
+
+    data = doc.to_dict()
+    if "stripeCustomerId" not in data:
+        raise Exception("stripeCustomerId not set for user")
+
+    return data["stripeCustomerId"]
 
 def add_document(collection: str, data: dict) -> dict:
     doc_ref = db.collection(collection).document()
@@ -371,8 +390,38 @@ app.add_middleware(
 )
 
 #####################################################
+
+
+app.include_router(billing_router)
+
 #  login endpoints
 #####################################################
+
+
+@app.post("/dev/create-stripe-customer")
+def create_stripe_customer(userId: str = Body(...), email: str = Body(...)):
+    try:
+        import stripe
+        stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+        # 1. Create Stripe customer
+        customer = stripe.Customer.create(email=email)
+
+        # 2. Save stripeCustomerId in Firestore
+        db.collection("users").document(userId).set({
+            "stripeCustomerId": customer.id
+        }, merge=True)
+
+        return {
+            "success": True,
+            "message": "Stripe customer created and linked",
+            "stripeCustomerId": customer.id
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe customer creation failed: {str(e)}")
+
+
 @app.post("/auth/login")
 def login_user(payload: LoginRequest):
     try:
@@ -732,6 +781,148 @@ def end_break(attendanceId: str):
 
     return updated
 
+@app.get("/v1/attendance/site-summary")
+def get_site_attendance_summary(
+    agency_id: str = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...)
+):
+    try:
+        start = datetime.fromisoformat(start_date).date()
+        end = datetime.fromisoformat(end_date).date()
+
+        # 1. All active employees grouped by site
+        employees = get_documents_by_field("employees", "agencyId", agency_id)
+        site_employee_map = {}
+
+        for emp in employees:
+            if emp.get("status") == "active" and emp.get("assignedsiteID"):
+                site_id = emp["assignedsiteID"]
+                site_employee_map.setdefault(site_id, []).append(emp["id"])
+
+        # 2. All attendance records (not filtered yet)
+        attendance_records = get_documents_by_field("attendance", "agencyId", agency_id)
+
+        # 3. Get site names
+        sites = get_documents_by_field("sites", "agencyId", agency_id)
+        site_id_name_map = {s["id"]: s.get("name", "Unnamed Site") for s in sites if "id" in s}
+
+        # 4. Build summary
+        site_summary = []
+        for site_id, employee_ids in site_employee_map.items():
+            filtered_attendance = [
+                a for a in attendance_records
+                if a.get("userId") in employee_ids
+                and a.get("siteId") == site_id
+                and a.get("clockIn")
+                and start <= datetime.fromisoformat(a["clockIn"].replace("Z", "+00:00")).date() <= end
+            ]
+
+            present = len(filtered_attendance)
+            late = sum(
+                1 for a in filtered_attendance
+                if "scheduledStart" in a and
+                datetime.fromisoformat(a["clockIn"].replace("Z", "+00:00")) >
+                datetime.fromisoformat(a["scheduledStart"].replace("Z", "+00:00"))
+            )
+
+            total = len(employee_ids)
+            absent = max(total - present, 0)
+            attendance_rate = f"{round((present / total) * 100)}%" if total else "0%"
+
+            site_summary.append({
+                "siteId": site_id,
+                "siteName": site_id_name_map.get(site_id, site_id),
+                "date": str(end),
+                "totalEmployees": total,
+                "present": present,
+                "absent": absent,
+                "late": late,
+                "attendanceRate": attendance_rate,
+            })
+
+        return {"success": True, "data": site_summary}
+
+    except Exception as e:
+        logger.error(f"[Site Summary Error] {str(e)}")
+        return {"success": False, "message": str(e)}
+
+
+
+@app.get("/v1/attendance/summary")
+def get_attendance_summary(agency_id: str = Query(...)):
+    from datetime import datetime, timedelta
+
+    today = datetime.utcnow().date()
+    now = datetime.utcnow()
+
+    # 1. Fetch today's shifts for this agency
+    all_shifts = db.collection("shifts").where("agencyId", "==", agency_id).stream()
+    today_shifts = []
+    scheduled_employee_ids = set()
+
+    for shift_doc in all_shifts:
+        shift = shift_doc.to_dict()
+        shift_start = safe_parse_datetime(shift.get("shiftStart"))
+        if shift_start and shift_start.date() == today:
+            today_shifts.append((shift_doc.id, shift))
+            scheduled_employee_ids.add(shift["employeeId"])
+
+    # 2. Fetch all employees of the agency
+    all_employees = get_documents_by_field("employees", "agencyId", agency_id)
+    valid_employees = [
+    e for e in all_employees
+    if e.get("status") == "active"
+    and e.get("joinCodeStatus") == "used"
+    and e.get("assignedsiteID")
+    ]
+    all_employee_ids = set(e["id"] for e in valid_employees)
+
+
+    # 3. Fetch today’s attendance
+    attendance = db.collection("attendance").where("agencyId", "==", agency_id).stream()
+    present_ids = set()
+    late_count = 0
+    overtime_total = 0
+
+    for att_doc in attendance:
+        att = att_doc.to_dict()
+        clock_in = safe_parse_datetime(att.get("clockIn"))
+        if not clock_in or clock_in.date() != today:
+            continue
+
+        user_id = att["userId"]
+        present_ids.add(user_id)
+        overtime_total += att.get("overtimeHours", 0)
+
+        # Check if late
+        scheduled_start = safe_parse_datetime(att.get("scheduledStart"))
+        if scheduled_start and clock_in > scheduled_start:
+            late_count += 1
+
+    # 4. Absentees
+    scheduled_absentees = scheduled_employee_ids - present_ids
+    unscheduled_absentees = all_employee_ids - scheduled_employee_ids - present_ids
+
+    return {
+        "present": len(present_ids),
+        "totalScheduled": len(scheduled_employee_ids),
+        "absent": {
+            "total": len(scheduled_absentees) + len(unscheduled_absentees),
+            "scheduled": len(scheduled_absentees),
+            "unscheduled": len(unscheduled_absentees)
+        },
+        "late": {
+            "count": late_count,
+            "percentage": round((late_count / len(present_ids)) * 100, 1) if present_ids else 0.0
+        },
+        "overtime": {
+            "totalHours": round(overtime_total, 2),
+            "period": "this_week"
+        }
+    }
+
+
 @app.get("/v1/attendance", response_model=List[Attendance])
 def read_attendance(agency_id: str = Query(...)):
     return get_documents_by_field("attendance", "agencyId", agency_id)
@@ -825,11 +1016,14 @@ def clock_in(attendance: Attendance):
         "updatedAt": now_str
     }
 
-    saved = add_document("attendance", record)
-
+    saved_doc = db.collection("attendance").document()
+    saved_doc.set(record)
+    record["attendanceId"] = saved_doc.id  # 🔁 inject the ID
     logger.info("Clock-in success", extra={"userId": user_id, "siteId": site_id, "shiftId": shift_id})
 
-    return saved
+    return record
+
+
 
 
 
@@ -1222,30 +1416,41 @@ def check_shift_conflict(employee_id: str, new_start: str, new_end: str, exclude
 
 
 @app.get("/v1/calendar/shifts")
-def get_calendar_shifts(agency_id: str = Query(...), start_date: str = Query(...), end_date: str = Query(...)):
-    """Get shifts formatted for FullCalendar"""
+def get_calendar_shifts(
+    agency_id: str = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    site_id: Optional[str] = Query(None)
+):
     shifts = get_documents_by_field("shifts", "agencyId", agency_id)
-    
-    # Filter by date range
+
     start = datetime.fromisoformat(start_date.rstrip("Z"))
     end = datetime.fromisoformat(end_date.rstrip("Z"))
-    
+
     filtered_shifts = []
     for shift in shifts:
         shift_start = datetime.fromisoformat(shift["shiftStart"].rstrip("Z"))
         shift_end = datetime.fromisoformat(shift["shiftEnd"].rstrip("Z"))
-        
-        if (shift_start >= start and shift_start <= end) or (shift_end >= start and shift_end <= end):
-            filtered_shifts.append(shift)
-    
-    # Format for FullCalendar
+
+        # 🧠 Date range overlap check
+        if (shift_end < start or shift_start > end):
+            continue
+
+        # ❗ Site filter
+        if site_id and shift.get("siteId") != site_id:
+            continue
+
+        filtered_shifts.append(shift)
+
+    # Format as FullCalendar events
     calendar_events = []
     for shift in filtered_shifts:
         employee_id = shift["employeeId"]
-        employee = get_document_by_id("employees", employee_id)
         site_id = shift["siteId"]
+
+        employee = get_document_by_id("employees", employee_id)
         site = get_document_by_id("sites", site_id)
-        
+
         calendar_events.append({
             "id": shift["id"],
             "title": f"{employee['name']} - {site['name']}",
@@ -1258,8 +1463,9 @@ def get_calendar_shifts(agency_id: str = Query(...), start_date: str = Query(...
                 "siteName": site["name"]
             }
         })
-    
+
     return calendar_events
+
 
 
 @app.post("/v1/calendar/shifts")
