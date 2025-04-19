@@ -642,6 +642,42 @@ def read_incidents(agency_id: str = Query(...)):
 def create_incident(incident: Incident):
     return add_document("incidents", incident.dict(exclude_unset=True))
 
+@app.post("/mobile/incidents")
+def submit_incident(report: Incident):
+    data = report.dict(exclude_unset=True)
+    saved = add_document("incidents", data)
+    saved["id"] = saved["id"]  # Ensure ID is returned
+    return saved
+
+@app.get("/mobile/reports")
+def get_reports_for_employee(employee_id: str = Query(...), agency_id: str = Query(...)):
+    # Hourly Reports
+    hourly = db.collection("hourlyReports") \
+        .where("userId", "==", employee_id) \
+        .where("agencyId", "==", agency_id) \
+        .order_by("createdAt", direction=firestore.Query.DESCENDING) \
+        .stream()
+
+    hourly_list = [
+        {**doc.to_dict(), "type": "hourly", "id": doc.id}
+        for doc in hourly
+    ]
+
+    # Incident Reports
+    incidents = db.collection("incidents") \
+        .where("userId", "==", employee_id) \
+        .where("agencyId", "==", agency_id) \
+        .order_by("createdAt", direction=firestore.Query.DESCENDING) \
+        .stream()
+
+    incident_list = [
+        {**doc.to_dict(), "type": "incident", "id": doc.id}
+        for doc in incidents
+    ]
+
+    return sorted(hourly_list + incident_list, key=lambda x: x.get("createdAt", ""), reverse=True)
+
+
 #####################################################
 # 10. GeoFence Endpoints
 #####################################################
