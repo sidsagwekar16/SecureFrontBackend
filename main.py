@@ -1064,9 +1064,39 @@ def clock_in(attendance: Attendance):
     saved_doc = db.collection("attendance").document()
     saved_doc.set(record)
     record["attendanceId"] = saved_doc.id  # 🔁 inject the ID
+    
+    # ✅ UPDATE EMPLOYEE LOCATION
+    db.collection("employees").document(user_id).update({
+     "lastKnownLocation": {
+         "lat": data["lat"],
+         "lng": data["lng"],
+         "updatedAt": now_str
+         }
+    })
     logger.info("Clock-in success", extra={"userId": user_id, "siteId": site_id, "shiftId": shift_id})
 
     return record
+
+
+###delete later 
+@app.post("/dev/employees/update-location")
+def update_employee_location(body: dict = Body(...)):
+    user_id = body["userId"]
+    lat = body["lat"]
+    lng = body["lng"]
+    updated_at = body.get("updatedAt") or datetime.utcnow().isoformat() + "Z"
+
+    db.collection("employees").document(user_id).update({
+        "lastKnownLocation": {
+            "lat": lat,
+            "lng": lng,
+            "updatedAt": updated_at
+        }
+    })
+
+    return {"success": True, "message": "Location updated"}
+
+#####
 
 
 
@@ -2149,18 +2179,17 @@ def get_site_employees(site_id: str):
         raise HTTPException(status_code=404, detail="Site not found")
     
     site_data = site_doc.to_dict()
-
-    # Get employees assigned to this site
-    employees_ref = db.collection("employees").where("siteId", "==", site_id)
+    employees_ref = db.collection("employees").where("assignedsiteID", "==", site_id).stream()
     employees = []
-    for doc in employees_ref.stream():
-        data = doc.to_dict()
-        employees.append({
-            "id": doc.id,
-            "name": data["name"],
-            "status": data.get("status", "Unknown"),
-            "location": data.get("lastKnownLocation", None),  # should be {lat, lng}
-        })
+
+    for doc in employees_ref:  # ✅ FIXED
+     data = doc.to_dict()
+     employees.append({
+         "id": doc.id,
+         "name": data["name"],
+         "status": data.get("status", "Unknown"),
+         "location": data.get("lastKnownLocation", None),
+     })
 
     return {"site": site_data, "employees": employees}
 
