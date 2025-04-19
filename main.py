@@ -390,9 +390,15 @@ app = FastAPI(
     version="1.3.16"  # Updated version
 )
 
+origins = [
+    "http://localhost:3000",  # local dev frontend
+    "http://127.0.0.1:3000",  # optional for some setups
+    "https://securefrontfrontend-master.onrender.com",  # production frontend
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
