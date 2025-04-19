@@ -9,8 +9,10 @@ from dotenv import load_dotenv
 load_dotenv()
 import firebase_admin.messaging as messaging
 from typing import Annotated
+from enum import Enum
 from datetime import datetime
 from fastapi.responses import StreamingResponse
+from typing import Literal
 from fastapi import Header, Depends
 from typing import List, Dict, Optional
 import io
@@ -248,6 +250,7 @@ class Shift(BaseModel):
     siteId: str
     shiftStart: str
     shiftEnd: str
+    status: Optional[Literal["pending", "confirmed", "declined", "completed", "open"]] = "pending"
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
@@ -342,6 +345,12 @@ class SiteNotification(BaseModel):
     createdAt: Optional[str] = None
 
 
+class ShiftStatus(str, Enum):
+    pending = "pending"
+    confirmed = "confirmed"
+    declined = "declined"
+    completed = "completed"
+    open = "open"
 
 
 
@@ -1722,14 +1731,26 @@ def verify_geofence(site_id: str = Query(...), lat: float = Query(...), lng: flo
 
 @app.get("/mobile/shifts/assigned", response_model=List[Shift])
 def get_assigned_shifts(employee_id: str = Query(...)):
-    return get_documents_by_field("shifts", "employeeId", employee_id)
+    shifts = get_documents_by_field("shifts", "employeeId", employee_id)
+    
+    # Inject shiftId field explicitly
+    for s in shifts:
+        if "shiftId" not in s:
+            s["shiftId"] = s.get("id")
+    
+    return shifts
+
 
 @app.patch("/mobile/shifts/{shift_id}/status")
-def update_shift_status(shift_id: str, status: str = Query(...), employee_id: str = Query(...)):
+def update_shift_status(
+    shift_id: str,
+    status: ShiftStatus = Query(...),
+    employee_id: str = Query(...)
+):
     shift = get_document_by_id("shifts", shift_id)
     if shift.get("employeeId") != employee_id:
         raise HTTPException(status_code=403, detail="You are not assigned to this shift")
-    return update_document("shifts", shift_id, {"status": status})
+    return update_document("shifts", shift_id, {"status": status.value})
 
 
 @app.get("/mobile/shifts/open", response_model=List[Shift])
@@ -2117,6 +2138,31 @@ def get_dashboard_metrics(agency_id: str = Query(...)):
 
 
 
+########
+#test api's
+######
+@app.get("/dashboard/site-employees")
+def get_site_employees(site_id: str):
+    # Fetch site geofence and location
+    site_doc = db.collection("sites").document(site_id).get()
+    if not site_doc.exists:
+        raise HTTPException(status_code=404, detail="Site not found")
+    
+    site_data = site_doc.to_dict()
+
+    # Get employees assigned to this site
+    employees_ref = db.collection("employees").where("siteId", "==", site_id)
+    employees = []
+    for doc in employees_ref.stream():
+        data = doc.to_dict()
+        employees.append({
+            "id": doc.id,
+            "name": data["name"],
+            "status": data.get("status", "Unknown"),
+            "location": data.get("lastKnownLocation", None),  # should be {lat, lng}
+        })
+
+    return {"site": site_data, "employees": employees}
 
 
 
